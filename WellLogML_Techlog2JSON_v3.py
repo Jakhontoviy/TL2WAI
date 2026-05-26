@@ -1,54 +1,4 @@
-from math import *
-from TechlogMath import *
-from operator import *
-import sys
-
-PI     = 3.14159265358979323846
-PIO2   = 1.57079632679489661923
-PIO4   = 7.85398163397448309616E-1
-SQRT2  = 1.41421356237309504880
-SQRTH  = 7.07106781186547524401E-1
-E      = exp(1)
-LN2    = log(2)
-LN10   = log(10)
-LOG2E  = 1.4426950408889634073599
-LOG10E = 1.0 / LN10
-MissingValue = -9999
-def iif(condition, trueResult=MissingValue, falseResult=MissingValue):
-	if condition:
-		return trueResult
-	else:
-		return falseResult
-
-#Declarations
-#The dictionary of parameters v2.0
-#name,label,bname,type,family,measurement,unit,value,mode,description,group,min,max,list,enable,iscombocheckbox,isused
-parameterDict = {}
-try:
-	if Parameter:
-		pass
-except NameError:
-	class Parameter:
-		def __init__(self, **d):
-			pass
-
-__author__ = """Yan P (user)"""
-__date__ = """2026-01-13"""
-__version__ = """1.0"""
-__group__ = """"""
-__suffix__ = """"""
-__prefix__ = """"""
-__applyMode__ = """0"""
-__awiEngine__ = """v2"""
-__layoutTemplateMode__ = """"""
-__includeMissingValues__ = """True"""
-__keepPreviouslyComputedValues__ = """True"""
-__areInputDisplayed__ = """True"""
-__useMultiWellLayout__ = """True"""
-__useFamilyAssignmentRules__ = """True"""
-__idForHelp__ = """"""
-__executionGranularity__ = """full"""
-#DeclarationsEnd
+# -*- coding: utf-8 -*-
 import json
 import os
 import tempfile
@@ -71,8 +21,6 @@ class WellLogMLGenerator:
         self.data = None
         self.logger = logger
         self.current_dataset_name = None
-        # FIX: инициализируем атрибуты, которые устанавливаются в create_document,
-        # чтобы избежать AttributeError при некорректном порядке вызовов
         self.current_well_name = None
         self.current_well_id = None
 
@@ -134,8 +82,85 @@ class WellLogMLGenerator:
         import uuid
         return str(uuid.uuid4()).replace('-', '')[:24]
 
+    @staticmethod
+    def _is_html_content(text: str) -> Tuple[bool, str]:
+        """
+        Обнаружить HTML-подобное содержимое в текстовых свойствах.
+
+        Возвращает:
+            Кортеж (is_html, reason), где:
+            - is_html: True если содержимое похоже на HTML
+            - reason: Описание обнаруженного HTML признака
+        """
+        if not isinstance(text, str):
+            return False, ""
+
+        text_stripped = text.strip()
+        if not text_stripped:
+            return False, ""
+
+        # Признак 1: Начинается с < и содержит HTML теги
+        if text_stripped.startswith('<') and ('>' in text_stripped):
+            html_tags = ['<table', '<tr', '<td', '<th', '<div', '<span', '<html', '<body',
+                        '<head', '<p>', '<br', '<a href', '<form', '<input', '<script', '<style']
+            for tag in html_tags:
+                if tag.lower() in text_stripped.lower():
+                    return True, f"Найден HTML тег: {tag}"
+
+        # Признак 2: Очень большой текст (> 500 символов) с HTML структурой
+        if len(text_stripped) > 500:
+            html_indicators = ['<table', '<tr', '<td', '<th', '&nbsp;', '&lt;', '&gt;', '&amp;']
+            indicators_found = sum(1 for ind in html_indicators if ind.lower() in text_stripped.lower())
+            if indicators_found >= 1:
+                return True, f"Большой текст ({len(text_stripped)} символов) с HTML структурой"
+
+        return False, ""
+
+    @staticmethod
+    def _detect_data_type(data) -> str:
+        """
+        Определить тип данных: 'numeric', 'string', или 'mixed'.
+
+        Возвращает:
+            'numeric' - все значения числовые (int, float, или NaN)
+            'string' - содержит строки
+            'mixed' - смешанные типы
+        """
+        if data is None or len(data) == 0:
+            return 'empty'
+
+        has_numeric = False
+        has_string = False
+
+        for val in data:
+            if val is None:
+                continue
+
+            if isinstance(val, (int, float, np.integer, np.floating)):
+                has_numeric = True
+                continue
+
+            if isinstance(val, str):
+                try:
+                    float(val)
+                    has_numeric = True
+                except (ValueError, TypeError):
+                    has_string = True
+                continue
+
+            has_string = True
+
+        if has_string and has_numeric:
+            return 'mixed'
+        elif has_string:
+            return 'string'
+        elif has_numeric:
+            return 'numeric'
+        else:
+            return 'unknown'
+
     def _read_well_id(self, well_name: str) -> str:
-        """Прочитать свойство ID скважины или сгенерировать новый."""
+        """Прочитать свойство ID скважины или сгенерировать и сохранить новый."""
         try:
             prop_list = db.wellPropertyList(well_name)
             if 'ID' in prop_list:
@@ -144,10 +169,15 @@ class WellLogMLGenerator:
                     return str(existing_id)
         except Exception:
             pass
-        return self._generate_id()
+        new_id = self._generate_id()
+        try:
+            db.setWellPropertyValue(well_name, 'ID', new_id)
+        except Exception:
+            pass
+        return new_id
 
     def _read_dataset_id(self, well_name: str, dataset_name: str) -> str:
-        """Прочитать свойство ID датасета или сгенерировать новый."""
+        """Прочитать свойство ID датасета или сгенерировать и сохранить новый."""
         try:
             prop_list = db.datasetPropertyList(well_name, dataset_name)
             if 'ID' in prop_list:
@@ -156,10 +186,15 @@ class WellLogMLGenerator:
                     return str(existing_id)
         except Exception:
             pass
-        return self._generate_id()
+        new_id = self._generate_id()
+        try:
+            db.setDatasetPropertyValue(well_name, dataset_name, 'ID', new_id)
+        except Exception:
+            pass
+        return new_id
 
     def _read_variable_id(self, well_name: str, dataset_name: str, variable_name: str) -> str:
-        """Прочитать свойство ID переменной или сгенерировать новый."""
+        """Прочитать свойство ID переменной или сгенерировать и сохранить новый."""
         try:
             prop_list = db.variablePropertyList(well_name, dataset_name, variable_name)
             if 'ID' in prop_list:
@@ -168,7 +203,12 @@ class WellLogMLGenerator:
                     return str(existing_id)
         except Exception:
             pass
-        return self._generate_id()
+        new_id = self._generate_id()
+        try:
+            db.setVariablePropertyValue(well_name, dataset_name, variable_name, 'ID', new_id)
+        except Exception:
+            pass
+        return new_id
 
     @staticmethod
     def sync_project_ids(logger: logging.Logger = None) -> Dict[str, int]:
@@ -187,7 +227,6 @@ class WellLogMLGenerator:
 
 
     def _log(self, message: str, level: str = 'info'):
-        # FIX: использовать getattr вместо if/elif, чтобы не игнорировать неизвестные уровни
         if self.logger:
             log_fn = getattr(self.logger, level, self.logger.info)
             log_fn(message)
@@ -265,6 +304,13 @@ class WellLogMLGenerator:
 
                 try:
                     prop_value = db.wellPropertyValue(well_name, prop_name)
+
+                    # Пропускаем HTML содержимое в свойствах
+                    is_html, reason = self._is_html_content(str(prop_value) if prop_value is not None else '')
+                    if is_html:
+                        self._log(f"      Свойство скважины '{prop_name}': пропущено (HTML контент: {reason})", 'debug')
+                        continue
+
                     prop_unit = db.wellPropertyUnit(well_name, prop_name)
                     prop_description = db.wellPropertyDescription(well_name, prop_name)
 
@@ -446,7 +492,6 @@ class WellLogMLGenerator:
 
         try:
             prop_list = db.datasetPropertyList(well_name, dataset_name)
-            # FIX: упрощена проверка — if prop_list достаточно
             if prop_list:
                 for prop_name in prop_list:
                     if prop_name == 'ID':
@@ -454,6 +499,12 @@ class WellLogMLGenerator:
 
                     try:
                         prop_value = db.datasetPropertyValue(well_name, dataset_name, prop_name)
+
+                        # Пропускаем HTML содержимое в свойствах
+                        is_html, reason = self._is_html_content(str(prop_value) if prop_value is not None else '')
+                        if is_html:
+                            self._log(f"      Свойство датасета '{prop_name}': пропущено (HTML контент: {reason})", 'debug')
+                            continue
 
                         try:
                             prop_unit = db.datasetPropertyUnit(well_name, dataset_name, prop_name)
@@ -494,9 +545,6 @@ class WellLogMLGenerator:
                             "userName": item_username,
                             "action": hist_item.get('action', '')
                         })
-                    # FIX: ветка else была вырвана из цикла for и помещена в else внешнего if.
-                    # hist_item был не определён в той области видимости => NameError.
-                    # Возвращаем её на правильное место — внутрь цикла for.
                     else:
                         hist_item_str = str(hist_item).strip()
 
@@ -542,7 +590,7 @@ class WellLogMLGenerator:
         try:
             var_type = db.variableType(well_name, dataset_name, variable_name)
         except Exception:
-            var_type = 'Continu'
+            var_type = 'Continuous'
 
         try:
             family = db.variableFamily(well_name, dataset_name, variable_name)
@@ -575,6 +623,12 @@ class WellLogMLGenerator:
 
         variable_id = self._read_variable_id(well_name, dataset_name, variable_name)
 
+        # Если данные содержат строки, установить единицы измерения как 'unitless'
+        if data is not None and len(data) > 0:
+            data_type = self._detect_data_type(data)
+            if data_type in ('string', 'mixed'):
+                unit = 'unitless'
+
         variable_dict = {
             "@id": variable_id,
             "nullValue": null_value,
@@ -593,7 +647,6 @@ class WellLogMLGenerator:
                 for hist_item in var_history:
                     if isinstance(hist_item, dict):
                         item_timestamp = hist_item.get('dateTime')
-                        # FIX: добавлена проверка на пустую строку — единообразно с create_document/add_dataset
                         if item_timestamp is None or item_timestamp == '':
                             item_timestamp = str(self._get_timestamp())
 
@@ -641,7 +694,6 @@ class WellLogMLGenerator:
 
         try:
             prop_list = db.variablePropertyList(well_name, dataset_name, variable_name)
-            # FIX: упрощена проверка — if prop_list достаточно
             if prop_list:
                 for prop_name in prop_list:
                     if prop_name == 'ID':
@@ -649,6 +701,12 @@ class WellLogMLGenerator:
 
                     try:
                         prop_value = db.variablePropertyValue(well_name, dataset_name, variable_name, prop_name)
+
+                        # Пропускаем HTML содержимое в свойствах
+                        is_html, reason = self._is_html_content(str(prop_value) if prop_value is not None else '')
+                        if is_html:
+                            self._log(f"      Свойство переменной '{prop_name}': пропущено (HTML контент: {reason})", 'debug')
+                            continue
 
                         try:
                             prop_unit = db.variablePropertyUnit(well_name, dataset_name, variable_name, prop_name)
@@ -671,16 +729,28 @@ class WellLogMLGenerator:
             pass
 
         if data is not None and len(data) > 0:
-            try:
-                data_array = np.asarray(data, dtype=float)
-                data_clean = np.where(
-                    (np.isnan(data_array)) | (data_array == null_value),
-                    null_value,
-                    data_array
-                )
-                variable_dict["variableData"] = [float(val) for val in data_clean]
-            except (ValueError, TypeError):
+            data_type = self._detect_data_type(data)
+            self._log(f"        Кривая {var_name}: обнаружен тип данных '{data_type}'")
+
+            if data_type in ('numeric', 'mixed'):
+                try:
+                    data_array = np.asarray(data, dtype=float)
+                    data_clean = np.where(
+                        (np.isnan(data_array)) | (data_array == null_value),
+                        null_value,
+                        data_array
+                    )
+                    variable_dict["variableData"] = [float(val) for val in data_clean]
+                    self._log(f"        Кривая {var_name}: сохранено {len(data_clean)} числовых значений")
+                except (ValueError, TypeError):
+                    variable_dict["variableData"] = [str(val) if val is not None else '' for val in data]
+                    self._log(f"        Кривая {var_name}: сохранено {len(data)} значений как текст")
+            else:
                 variable_dict["variableData"] = [str(val) if val is not None else '' for val in data]
+                self._log(f"        Кривая {var_name}: сохранено {len(data)} текстовых значений")
+        else:
+            variable_dict["variableData"] = []
+            self._log(f"        Кривая {var_name}: нет данных", 'warning')
 
         self.data["WellLogML"][self.current_well_name]["datasets"][self.current_dataset_name]["variables"][var_name] = variable_dict
         return True
@@ -839,7 +909,6 @@ class WellLogMLGenerator:
         Returns:
             True если файл был записан, False если запись пропущена
         """
-        # FIX: убран неиспользуемый параметр pretty_print
         if self.data is None:
             raise ValueError("Сначала создайте документ с помощью create_document()")
 
@@ -870,15 +939,24 @@ class WellLogMLGenerator:
             indent = match.group(1)
             key_name = match.group(2)
             array_content = match.group(3)
+
+            # Проверяем, содержит ли массив текстовые строки (кавычки)
+            if '"' in array_content:
+                # Это текстовые данные - не компактируем, оставляем как есть
+                return match.group(0)
+
+            # Это числовые данные - компактируем
             values = re.findall(r'-?\d+\.?\d*(?:[eE][+-]?\d+)?', array_content)
+            if not values:
+                # Если ничего не найдено, оставляем как было
+                return match.group(0)
+
             compact = ', '.join(values)
             return f'{indent}"{key_name}": [{compact}]'
 
         pattern = r'(\s*)"(variableData)":\s*\[((?:[^\[\]]|\n)*?)\]'
         json_str = re.sub(pattern, compact_data_array, json_str)
 
-        # FIX: атомарная запись через временный файл рядом с целевым.
-        # Если запись прерывается (нет места, ошибка I/O), целевой файл не повреждается.
         target_dir = os.path.dirname(os.path.abspath(filename))
         fd, tmp_path = tempfile.mkstemp(dir=target_dir, suffix='.tmp')
         try:
@@ -959,7 +1037,6 @@ def welllogml_write_from_techlog():
         'variables_skipped_no_id': 0,
     }
 
-    # FIX: try/finally гарантирует закрытие лог-файла даже при необработанном исключении
     try:
         for idx, well_name in enumerate(wells, 1):
             well_start_time = datetime.now()
@@ -1011,6 +1088,11 @@ def welllogml_write_from_techlog():
 
                     for var_idx, variable_name in enumerate(variables_to_export, 1):
                         try:
+                            try:
+                                var_type = db.variableType(well_name, dataset_name, variable_name)
+                            except Exception:
+                                var_type = 'Continuous'
+
                             curve_data = db.variableLoad(well_name, dataset_name, variable_name)
 
                             if curve_data is not None:
@@ -1033,10 +1115,8 @@ def welllogml_write_from_techlog():
 
                                 try:
                                     var_unit = db.variableUnit(well_name, dataset_name, variable_name)
-                                    var_type = db.variableType(well_name, dataset_name, variable_name)
                                 except Exception:
                                     var_unit = ''
-                                    var_type = ''
 
                                 msg = f"      [{var_idx}/{len(variables_to_export)}] {variable_name}"
                                 if var_unit:
@@ -1048,11 +1128,12 @@ def welllogml_write_from_techlog():
                                 print(f"    ✓ {msg}")
                                 logger.info(f"        Загружена переменная: {msg}")
                             else:
-                                msg = f"      [{var_idx}/{len(variables_to_export)}] {variable_name} - нет данных"
+                                msg = f"      [{var_idx}/{len(variables_to_export)}] {variable_name} ({var_type}) - нет данных"
                                 print(f"    ⚠ {msg}")
                                 logger.warning(f"        {msg}")
+                                logger.warning(f"          Возможные причины: db.variableLoad() вернула None или пустой результат")
                         except Exception as e:
-                            error_msg = f"      [{var_idx}/{len(variables_to_export)}] Ошибка при загрузке {variable_name}: {e}"
+                            error_msg = f"      [{var_idx}/{len(variables_to_export)}] Ошибка при загрузке {variable_name} ({var_type if 'var_type' in locals() else '?'}): {e}"
                             print(f"    ✗ {error_msg}")
                             logger.error(f"        {error_msg}")
 
@@ -1061,14 +1142,19 @@ def welllogml_write_from_techlog():
                 logger.info(f"    - Переменных: {well_total_vars}")
                 logger.info(f"    - Точек данных: {well_total_data_points:,}")
 
+                well_name_clean = str(well_name).strip()
+                for ch in r'\/:*?"<>|':
+                    well_name_clean = well_name_clean.replace(ch, '_')
+
                 json_stem = str(generator.current_well_id).strip()
                 for ch in r'\/:*?"<>|':
                     json_stem = json_stem.replace(ch, '_')
-                output_filename = os.path.join(folderName, f"{json_stem}.json")
+
+                output_filename = os.path.join(folderName, f"{well_name_clean}_{json_stem}.json")
 
                 file_exists = os.path.exists(output_filename)
 
-                print(f"\n  Сохранение файла: {json_stem}.json (скважина «{well_name}»)")
+                print(f"\n  Сохранение файла: {well_name_clean}_{json_stem}.json (скважина «{well_name}»)")
                 logger.info(f"\n  Сохранение результатов:")
                 logger.info(f"    Файл: {output_filename}")
                 logger.info(f"    Существует: {'Да' if file_exists else 'Нет'}")
@@ -1111,7 +1197,6 @@ def welllogml_write_from_techlog():
                 traceback.print_exc()
                 logger.error(traceback.format_exc())
     finally:
-        # FIX: лог-файл закрывается гарантированно, даже при необработанном исключении
         export_end_time = datetime.now()
         export_duration = (export_end_time - export_start_time).total_seconds()
 
@@ -1248,3 +1333,19 @@ if __name__ == '__main__':
         test_history_parsing()
     else:
         welllogml_write_from_techlog()
+
+__author__ = """new USER (Alexey)"""
+__date__ = """2026-05-26"""
+__version__ = """1.0"""
+__pyVersion__ = """3"""
+__group__ = """"""
+__suffix__ = """"""
+__prefix__ = """"""
+__applyMode__ = """0"""
+__layoutTemplateMode__ = """"""
+__includeMissingValues__ = """True"""
+__keepPreviouslyComputedValues__ = """True"""
+__areInputDisplayed__ = """True"""
+__useMultiWellLayout__ = """True"""
+__idForHelp__ = """"""
+__executionGranularity__ = """full"""
