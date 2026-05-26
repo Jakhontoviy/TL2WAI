@@ -346,7 +346,7 @@ class WellLogMLGenerator:
                     try:
                         index_type = db.variableType(well_name, dataset_name, ref_name)
                     except Exception:
-                        index_type = 'Continu'
+                        index_type = 'Continuous'
 
                     try:
                         index_family = db.variableFamily(well_name, dataset_name, ref_name)
