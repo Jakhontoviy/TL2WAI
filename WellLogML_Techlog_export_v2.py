@@ -666,13 +666,16 @@ class WellLogMLGenerator:
             pass
 
         if data is not None and len(data) > 0:
-            data_clean = np.where(
-                (np.isnan(data)) | (data == null_value),
-                null_value,
-                data
-            )
-
-            variable_dict["variableData"] = [float(val) for val in data_clean]
+            try:
+                data_array = np.asarray(data, dtype=float)
+                data_clean = np.where(
+                    (np.isnan(data_array)) | (data_array == null_value),
+                    null_value,
+                    data_array
+                )
+                variable_dict["variableData"] = [float(val) for val in data_clean]
+            except (ValueError, TypeError):
+                variable_dict["variableData"] = [str(val) if val is not None else '' for val in data]
 
         self.data["WellLogML"][self.current_well_name]["datasets"][self.current_dataset_name]["variables"][var_name] = variable_dict
         return True
