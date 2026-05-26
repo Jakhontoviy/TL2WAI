@@ -132,6 +132,7 @@ def replace_null_values(data, null_value=NULL_VALUE):
 
         # Работать с массивом как с object для гибкости
         data_obj = data.astype(object, copy=True)
+        original_shape = data_obj.shape
 
         # Функция для проверки каждого элемента
         def is_null_value(val):
@@ -142,17 +143,28 @@ def replace_null_values(data, null_value=NULL_VALUE):
                 # Проверить как строка (с учетом пробелов)
                 return str(val).strip() == null_str.strip()
 
-        # Применить функцию к каждому элементу
+        # Использовать numpy vectorize для более эффективной обработки
+        # или прямой цикл для меньших массивов
         flat_data = data_obj.ravel()
-        for i in range(len(flat_data)):
-            if is_null_value(flat_data[i]):
-                flat_data[i] = np.nan
+        null_mask = np.zeros(len(flat_data), dtype=bool)
+
+        # Быстрая обработка: попробовать как float
+        try:
+            null_mask = np.isclose(flat_data.astype(float), float(null_value), rtol=1e-5, atol=1e-8)
+        except (ValueError, TypeError):
+            # Если это не работает, проверить как строки
+            for i in range(len(flat_data)):
+                if is_null_value(flat_data[i]):
+                    null_mask[i] = True
+
+        # Заменить null значения на 'nan'
+        flat_data[null_mask] = np.nan
 
         # Восстановить исходную форму и преобразовать в float
-        data_obj = flat_data.reshape(data.shape)
+        data_obj = flat_data.reshape(original_shape)
         return data_obj.astype(float)
 
-    except Exception:
+    except Exception as e:
         # Если ничего не сработало - вернуть исходные данные
         return data
 
@@ -453,26 +465,37 @@ def import_well_from_json(prj, filepath):
                 # Проверить размер: должен совпадать с индексом или быть кратным (для многостолбцовых данных)
                 if len(var_values) != len(index_data):
                     # Может быть это многостолбцовый лог (например, изображение)
-                    if len(var_values) % len(index_data) == 0 and len(var_values) > len(index_data):
+                    if len(var_values) > 0 and len(var_values) % len(index_data) == 0:
                         num_columns = len(var_values) // len(index_data)
                         if num_columns > 1:  # Убедиться что это действительно многостолбцовые данные
-                            print(f'        ℹ {var_name}: переформатирование {len(var_values)} → ({len(index_data)}×{num_columns})')
-                            # Данные приходят упорядочены ПО СТОЛБЦАМ: [col1_all, col2_all, col3_all]
-                            # Сначала reshape в (num_columns, num_points), потом транспонируем в (num_points, num_columns)
-                            var_values = var_values.reshape((num_columns, len(index_data))).T
-                            # Продолжить с загрузкой многостолбцового лога
+                            print(f'        ℹ {var_name}: многостолбцовые данные - переформатирование {len(var_values)} → ({len(index_data)}×{num_columns})')
+                            try:
+                                # Данные приходят упорядочены ПО СТОЛБЦАМ: [col1_all, col2_all, col3_all]
+                                # Сначала reshape в (num_columns, num_points), потом транспонируем в (num_points, num_columns)
+                                reshaped = var_values.reshape((num_columns, len(index_data))).T
+                                print(f'          После reshape: форма {reshaped.shape}, тип {reshaped.dtype}')
+                                var_values = reshaped
+                                # Продолжить с загрузкой многостолбцового лога
+                            except Exception as e:
+                                print(f'        ✗ {var_name}: ошибка при переформатировании: {e}')
+                                stats['curves_skipped'] += 1
+                                continue
                         else:
                             # Это не многостолбцовые данные
                             print(f'        - {var_name}: размер данных {len(var_values)} не совпадает с индексом {len(index_data)} (пропущено)')
                             stats['curves_skipped'] += 1
                             continue
                     else:
-                        print(f'        - {var_name}: размер данных {len(var_values)} не совпадает с индексом {len(index_data)} (пропущено)')
+                        print(f'        - {var_name}: размер данных {len(var_values)} не совпадает с индексом {len(index_data)}, не кратен (пропущено)')
                         stats['curves_skipped'] += 1
                         continue
 
                 # Заменить null значения
                 var_values = replace_null_values(var_values, null_value)
+
+                # Логирование для многостолбцовых данных
+                if var_values.ndim == 2:
+                    print(f'          После replace_null_values: форма {var_values.shape}, содержит {np.sum(np.isnan(var_values))} NaN значений')
 
                 # Определение семейства (family) логирования
                 original_family = var_family  # Сохранить оригинальное значение из JSON
@@ -507,12 +530,26 @@ def import_well_from_json(prj, filepath):
                         print(f'        ℹ Загружено свойств логирования: {props_count}')
 
                 # Установить значения
+                # Для многостолбцовых данных (2D массивов) логировать размеры и проверку
+                if var_values.ndim == 2:
+                    num_nan = np.sum(np.isnan(var_values))
+                    print(f'          До set_rvalues: index {index_data.shape}, values {var_values.shape}, NaN={num_nan}')
+                    # Убедиться что первая размерность совпадает с индексом
+                    if var_values.shape[0] != len(index_data):
+                        print(f'          ✗ ОШИБКА: размеры не совпадают! index={len(index_data)}, values[0]={var_values.shape[0]}')
+                        stats['curves_skipped'] += 1
+                        continue
+
                 log.set_rvalues(index_data, var_values)
 
                 # Сохранить
                 log.save()
 
-                print(f'        ✓ {var_name} ({var_family}, {var_unit}, {len(var_values)} точек)')
+                # Логирование результата
+                if var_values.ndim == 2:
+                    print(f'        ✓ {var_name} ({var_family}, {var_unit}) {var_values.shape[0]} точек × {var_values.shape[1]} столбцов')
+                else:
+                    print(f'        ✓ {var_name} ({var_family}, {var_unit}, {len(var_values)} точек)')
                 stats['curves_ok'] += 1
 
             except Exception as e:
