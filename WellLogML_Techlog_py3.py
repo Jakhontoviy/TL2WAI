@@ -1,7 +1,11 @@
+# -*- coding: utf-8 -*-
+from __future__ import division
 from math import *
 from TechlogMath import *
 from operator import *
 import sys
+if sys.version_info[0]==3:
+    from six.moves import range
 
 PI     = 3.14159265358979323846
 PIO2   = 1.57079632679489661923
@@ -22,7 +26,7 @@ def iif(condition, trueResult=MissingValue, falseResult=MissingValue):
 
 #Declarations
 #The dictionary of parameters v2.0
-#name,label,bname,type,family,measurement,unit,value,mode,description,group,min,max,list,enable,iscombocheckbox,isused
+#name,bname,type,family,measurement,unit,value,mode,description,group,min,max,list,enable,iscombocheckbox,isused
 parameterDict = {}
 try:
 	if Parameter:
@@ -31,23 +35,6 @@ except NameError:
 	class Parameter:
 		def __init__(self, **d):
 			pass
-
-__author__ = """Yan P (user)"""
-__date__ = """2026-01-13"""
-__version__ = """1.0"""
-__group__ = """"""
-__suffix__ = """"""
-__prefix__ = """"""
-__applyMode__ = """0"""
-__awiEngine__ = """v2"""
-__layoutTemplateMode__ = """"""
-__includeMissingValues__ = """True"""
-__keepPreviouslyComputedValues__ = """True"""
-__areInputDisplayed__ = """True"""
-__useMultiWellLayout__ = """True"""
-__useFamilyAssignmentRules__ = """True"""
-__idForHelp__ = """"""
-__executionGranularity__ = """full"""
 #DeclarationsEnd
 import json
 import os
@@ -170,7 +157,7 @@ class WellLogMLGenerator:
         return False, ""
 
     def _read_well_id(self, well_name: str) -> str:
-        """Прочитать свойство ID скважины или сгенерировать и сохранить новый."""
+        """Прочитать свойство ID скважины или сгенерировать новый."""
         try:
             prop_list = db.wellPropertyList(well_name)
             if 'ID' in prop_list:
@@ -179,15 +166,10 @@ class WellLogMLGenerator:
                     return str(existing_id)
         except Exception:
             pass
-        new_id = self._generate_id()
-        try:
-            db.setWellPropertyValue(well_name, 'ID', new_id)
-        except Exception:
-            pass
-        return new_id
+        return self._generate_id()
 
     def _read_dataset_id(self, well_name: str, dataset_name: str) -> str:
-        """Прочитать свойство ID датасета или сгенерировать и сохранить новый."""
+        """Прочитать свойство ID датасета или сгенерировать новый."""
         try:
             prop_list = db.datasetPropertyList(well_name, dataset_name)
             if 'ID' in prop_list:
@@ -196,15 +178,10 @@ class WellLogMLGenerator:
                     return str(existing_id)
         except Exception:
             pass
-        new_id = self._generate_id()
-        try:
-            db.setDatasetPropertyValue(well_name, dataset_name, 'ID', new_id)
-        except Exception:
-            pass
-        return new_id
+        return self._generate_id()
 
     def _read_variable_id(self, well_name: str, dataset_name: str, variable_name: str) -> str:
-        """Прочитать свойство ID переменной или сгенерировать и сохранить новый."""
+        """Прочитать свойство ID переменной или сгенерировать новый."""
         try:
             prop_list = db.variablePropertyList(well_name, dataset_name, variable_name)
             if 'ID' in prop_list:
@@ -213,12 +190,7 @@ class WellLogMLGenerator:
                     return str(existing_id)
         except Exception:
             pass
-        new_id = self._generate_id()
-        try:
-            db.setVariablePropertyValue(well_name, dataset_name, variable_name, 'ID', new_id)
-        except Exception:
-            pass
-        return new_id
+        return self._generate_id()
 
     @staticmethod
     def sync_project_ids(logger: logging.Logger = None) -> Dict[str, int]:
@@ -743,14 +715,11 @@ class WellLogMLGenerator:
                     data_array
                 )
                 variable_dict["variableData"] = [float(val) for val in data_clean]
-                self._log(f"        Кривая {var_name}: загружено {len(data_clean)} числовых значений")
             except (ValueError, TypeError):
                 variable_dict["variableData"] = [str(val) if val is not None else '' for val in data]
-                self._log(f"        Кривая {var_name}: загружено {len(data)} текстовых значений (тип: {var_type})")
         else:
             # Если данных нет, установить пустой массив variableData
             variable_dict["variableData"] = []
-            self._log(f"        Кривая {var_name}: нет данных (data={data}, len={len(data) if data else 0})", 'warning')
 
         self.data["WellLogML"][self.current_well_name]["datasets"][self.current_dataset_name]["variables"][var_name] = variable_dict
         return True
@@ -1369,3 +1338,19 @@ if __name__ == '__main__':
         test_history_parsing()
     else:
         welllogml_write_from_techlog()
+
+__author__ = """new USER (Alexey)"""
+__date__ = """2026-05-26"""
+__version__ = """1.0"""
+__pyVersion__ = """3"""
+__group__ = """"""
+__suffix__ = """"""
+__prefix__ = """"""
+__applyMode__ = """0"""
+__layoutTemplateMode__ = """"""
+__includeMissingValues__ = """True"""
+__keepPreviouslyComputedValues__ = """True"""
+__areInputDisplayed__ = """True"""
+__useMultiWellLayout__ = """True"""
+__idForHelp__ = """"""
+__executionGranularity__ = """full"""
