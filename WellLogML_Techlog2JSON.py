@@ -14,7 +14,7 @@ TECHLOG_JSON_LOG_DIR = os.path.join(TECHLOG_JSON_ROOT, 'log')
 
 
 class WellLogMLGenerator:
-    """Класс для генерации файлов WellLogML в JSON формате из данных Techlog."""
+    """Generates WellLogML JSON files from Techlog data."""
 
     def __init__(self, techlog_version: str = "2023.1", logger: logging.Logger = None):
         self.techlog_version = techlog_version
@@ -26,15 +26,12 @@ class WellLogMLGenerator:
     @staticmethod
     def _parse_history_item(history_string: str) -> Tuple[str, str, str]:
         """
-        Парсит строку истории из Techlog.
+        Parse a Techlog history string.
 
-        Формат строки: "History item created at 2025-12-31T02:27:25.028 by user. Created"
+        Expected format: "History item created at 2025-12-31T02:27:25.028 by user. Created"
 
         Returns:
-            Кортеж (timestamp, username, action), где:
-            - timestamp: Unix timestamp в секундах (строка)
-            - username: Имя пользователя
-            - action: Описание действия
+            Tuple (timestamp, username, action) where timestamp is a Unix timestamp string.
         """
         pattern = r'at\s+([^\s]+(?:T[^\s]+)?)\s+by\s+([^.]+)\.\s*(.+)'
         match = re.search(pattern, history_string)
@@ -61,23 +58,21 @@ class WellLogMLGenerator:
             return str(int(datetime.now().timestamp())), 'unknown', history_string
 
     def _get_timestamp(self) -> int:
-        """Получить текущий timestamp Unix."""
+        """Return the current Unix timestamp."""
         return int(datetime.now().timestamp())
 
     def _get_username(self) -> str:
-        """Получить имя пользователя системы."""
+        """Return the current OS username."""
         return os.getenv('USERNAME', os.getenv('USER', 'user'))
 
 
     @staticmethod
     def _is_html_content(text: str) -> Tuple[bool, str]:
         """
-        Обнаружить HTML-подобное содержимое в текстовых свойствах.
+        Detect HTML-like content in text properties.
 
-        Возвращает:
-            Кортеж (is_html, reason), где:
-            - is_html: True если содержимое похоже на HTML
-            - reason: Описание обнаруженного HTML признака
+        Returns:
+            Tuple (is_html, reason) where is_html is True if the text looks like HTML.
         """
         if not isinstance(text, str):
             return False, ""
@@ -86,32 +81,32 @@ class WellLogMLGenerator:
         if not text_stripped:
             return False, ""
 
-        # Признак 1: Начинается с < и содержит HTML теги
+        # Check 1: starts with '<' and contains HTML tags
         if text_stripped.startswith('<') and ('>' in text_stripped):
             html_tags = ['<table', '<tr', '<td', '<th', '<div', '<span', '<html', '<body',
                         '<head', '<p>', '<br', '<a href', '<form', '<input', '<script', '<style']
             for tag in html_tags:
                 if tag.lower() in text_stripped.lower():
-                    return True, f"Найден HTML тег: {tag}"
+                    return True, f"HTML tag found: {tag}"
 
-        # Признак 2: Очень большой текст (> 500 символов) с HTML структурой
+        # Check 2: large text (> 500 chars) with HTML structure
         if len(text_stripped) > 500:
             html_indicators = ['<table', '<tr', '<td', '<th', '&nbsp;', '&lt;', '&gt;', '&amp;']
             indicators_found = sum(1 for ind in html_indicators if ind.lower() in text_stripped.lower())
             if indicators_found >= 1:
-                return True, f"Большой текст ({len(text_stripped)} символов) с HTML структурой"
+                return True, f"Large text ({len(text_stripped)} chars) with HTML structure"
 
         return False, ""
 
     @staticmethod
     def _detect_data_type(data) -> str:
         """
-        Определить тип данных: 'numeric', 'string', или 'mixed'.
+        Determine data type: 'numeric', 'string', or 'mixed'.
 
-        Возвращает:
-            'numeric' - все значения числовые (int, float, или NaN)
-            'string' - содержит строки
-            'mixed' - смешанные типы
+        Returns:
+            'numeric' — all values are numeric (int, float, or NaN)
+            'string'  — contains string values
+            'mixed'   — mixed types
         """
         if data is None or len(data) == 0:
             return 'empty'
@@ -155,7 +150,7 @@ class WellLogMLGenerator:
 
     def _extract_properties(self, prop_list: List[str], get_value_fn, get_unit_fn,
                           get_desc_fn) -> Dict[str, Dict[str, str]]:
-        """Универсальное извлечение свойств из любой сущности."""
+        """Generic property extraction from any Techlog entity."""
         properties = {}
         for prop_name in prop_list:
             if prop_name == 'ID':
@@ -174,7 +169,7 @@ class WellLogMLGenerator:
         return properties
 
     def _process_history(self, history_list) -> List[Dict[str, str]]:
-        """Универсальная обработка истории."""
+        """Generic history processing for any Techlog entity."""
         history = []
         if not history_list:
             return history
@@ -199,7 +194,7 @@ class WellLogMLGenerator:
         return history
 
     def create_document(self, well_name: str) -> bool:
-        """Создать базовую структуру документа для скважины."""
+        """Create the base document structure for a well."""
         try:
             well_name_value = db.wellName(well_name)
         except Exception:
@@ -270,13 +265,13 @@ class WellLogMLGenerator:
 
     def add_dataset(self, well_name: str, dataset_name: str) -> bool:
         """
-        Добавить информацию о датасете.
+        Add dataset information to the document.
 
         Returns:
-            True если датасет добавлен успешно.
+            True if the dataset was added successfully.
         """
         if self.data is None:
-            raise ValueError("Сначала создайте документ с помощью create_document()")
+            raise ValueError("Call create_document() before add_dataset()")
 
         try:
             dataset_name_value = db.datasetName(well_name, dataset_name)
@@ -367,9 +362,9 @@ class WellLogMLGenerator:
                         "variableData": index_values
                     }
 
-                    self._log(f"      Подготовлена индексная кривая: {ref_name} ({len(index_data):,} значений)")
+                    self._log(f"      Index curve ready: {ref_name} ({len(index_data):,} values)")
             except Exception as e:
-                self._log(f"      Не удалось загрузить индексную кривую {ref_name}: {e}", 'warning')
+                self._log(f"      Could not load index curve {ref_name}: {e}", 'warning')
 
         except Exception:
             dataset_dict["MeasurementDetails"] = {
@@ -404,7 +399,7 @@ class WellLogMLGenerator:
 
         if index_curve_info is not None:
             dataset_dict["index"] = index_curve_info
-            self._log(f"      Добавлена индексная кривая: {index_curve_info['name']} ({len(index_curve_info['variableData']):,} значений)")
+            self._log(f"      Index curve added: {index_curve_info['name']} ({len(index_curve_info['variableData']):,} values)")
 
         dataset_dict["variables"] = {}
 
@@ -415,13 +410,13 @@ class WellLogMLGenerator:
     def add_curve(self, well_name: str, dataset_name: str, variable_name: str,
                   data: Optional[np.ndarray] = None, null_value: float = -9999) -> bool:
         """
-        Добавить переменную в текущий датасет.
+        Add a variable to the current dataset.
 
         Returns:
-            False, если у переменной нет корректного свойства ID.
+            False if the variable has no valid ID property.
         """
         if self.data is None or self.current_dataset_name is None:
-            raise ValueError("Сначала добавьте датасет с помощью add_dataset()")
+            raise ValueError("Call add_dataset() before add_curve()")
 
         username = self._get_username()
 
@@ -518,9 +513,9 @@ class WellLogMLGenerator:
         return True
 
     def save(self, filename: str) -> bool:
-        """Сохранить JSON файл."""
+        """Save the document to a JSON file."""
         if self.data is None:
-            raise ValueError("Сначала создайте документ с помощью create_document()")
+            raise ValueError("Call create_document() before save()")
 
         json_str = json.dumps(self.data, ensure_ascii=False, indent=2)
 
@@ -529,15 +524,12 @@ class WellLogMLGenerator:
             key_name = match.group(2)
             array_content = match.group(3)
 
-            # Проверяем, содержит ли массив текстовые строки (кавычки)
+            # Leave string arrays as-is; compact only numeric arrays
             if '"' in array_content:
-                # Это текстовые данные - не компактируем, оставляем как есть
                 return match.group(0)
 
-            # Это числовые данные - компактируем
             values = re.findall(r'-?\d+\.?\d*(?:[eE][+-]?\d+)?', array_content)
             if not values:
-                # Если ничего не найдено, оставляем как было
                 return match.group(0)
 
             compact = ', '.join(values)
@@ -560,7 +552,7 @@ class WellLogMLGenerator:
             raise
 
         file_size = os.path.getsize(filename)
-        msg = f"Файл успешно записан: {filename} (размер: {file_size:,} байт)"
+        msg = f"File saved: {filename} (size: {file_size:,} bytes)"
         self._log(msg)
         print(f"  ✓ {msg}")
         return True
@@ -568,18 +560,18 @@ class WellLogMLGenerator:
 
 def welllogml_write_from_techlog(output_dir: str = None):
     """
-    Экспорт всех скважин из БД Techlog в файлы WellLogML JSON.
-    Для каждой скважины создаётся отдельный файл `<ID>.json`.
+    Export all wells from the Techlog database to WellLogML JSON files.
+    One file per well named `<WellName>_<timestamp>.json`.
 
     Args:
-        output_dir: Директория для сохранения JSON файлов. По умолчанию используется значение из TECHLOG_JSON_ROOT.
+        output_dir: Directory for JSON output. Defaults to TECHLOG_JSON_ROOT.
     """
     folderName = output_dir or TECHLOG_JSON_ROOT
     if not os.path.exists(folderName):
         os.makedirs(folderName)
-        print(f"Создан каталог для экспорта: {folderName}")
+        print(f"Export directory created: {folderName}")
     else:
-        print(f"Каталог для экспорта: {folderName}")
+        print(f"Export directory: {folderName}")
 
     os.makedirs(TECHLOG_JSON_LOG_DIR, exist_ok=True)
     log_filename = os.path.join(
@@ -598,22 +590,22 @@ def welllogml_write_from_techlog(output_dir: str = None):
 
     export_start_time = datetime.now()
 
-    logger.info("Начат экспорт данных из Techlog в WellLogML JSON")
-    logger.info(f"Время начала: {export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"Каталог экспорта: {folderName}")
+    logger.info("Starting export from Techlog to WellLogML JSON")
+    logger.info(f"Start time: {export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Export directory: {folderName}")
     logger.info(
-        "Экспорт только читает ID из БД; при отсутствии ID сущность пропускается. "
-        "Подготовка: WellLogML_Techlog_prepare_ids.py"
+        "Export reads only IDs from the DB; entities without an ID are skipped. "
+        "Preparation: WellLogML_Techlog_prepare_ids.py"
     )
-    print(f"Лог-файл: {log_filename}")
+    print(f"Log file: {log_filename}")
     print(
-        "Требуются свойства ID (24 символа). При необходимости сначала: "
+        "ID properties (24 chars) are required. If needed, run first: "
         "WellLogML_Techlog_prepare_ids.py"
     )
 
     wells = db.wellList()
-    print(f"Найдено скважин: {len(wells)}")
-    logger.info(f"Найдено скважин для экспорта: {len(wells)}")
+    print(f"Wells found: {len(wells)}")
+    logger.info(f"Wells to export: {len(wells)}")
 
     stats = {
         'total': len(wells),
@@ -630,32 +622,32 @@ def welllogml_write_from_techlog(output_dir: str = None):
             well_start_time = datetime.now()
 
             print(f"\n{'='*60}")
-            print(f"[{idx}/{len(wells)}] Обработка скважины: {well_name}")
+            print(f"[{idx}/{len(wells)}] Processing well: {well_name}")
             print(f"{'='*60}")
 
             try:
                 logger.info(f"{'='*60}")
-                logger.info(f"[{idx}/{len(wells)}] Начата обработка скважины: {well_name}")
-                logger.info(f"  Время начала: {well_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"[{idx}/{len(wells)}] Started: {well_name}")
+                logger.info(f"  Start time: {well_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 logger.info(f"{'='*60}")
                 generator = WellLogMLGenerator(techlog_version="2023.1", logger=logger)
 
                 if not generator.create_document(well_name):
                     stats['errors'] += 1
                     stats['wells_skipped_no_id'] += 1
-                    logger.error(f"Скважина «{well_name}» пропущена: нет корректного свойства ID")
+                    logger.error(f"Well '{well_name}' skipped: no valid ID property")
                     continue
 
                 datasets = db.datasetList(well_name)
-                print(f"  Датасетов: {len(datasets)}")
-                logger.info(f"  Найдено датасетов: {len(datasets)}")
+                print(f"  Datasets: {len(datasets)}")
+                logger.info(f"  Datasets found: {len(datasets)}")
 
                 well_total_vars = 0
                 well_total_data_points = 0
 
                 for ds_idx, dataset_name in enumerate(datasets, 1):
-                    print(f"\n  [{ds_idx}/{len(datasets)}] Датасет: {dataset_name}")
-                    logger.info(f"  [{ds_idx}/{len(datasets)}] Обработка датасета: {dataset_name}")
+                    print(f"\n  [{ds_idx}/{len(datasets)}] Dataset: {dataset_name}")
+                    logger.info(f"  [{ds_idx}/{len(datasets)}] Processing dataset: {dataset_name}")
 
                     if not generator.add_dataset(well_name, dataset_name):
                         stats['datasets_skipped_no_id'] += 1
@@ -670,9 +662,9 @@ def welllogml_write_from_techlog(output_dir: str = None):
 
                     variables_to_export = [v for v in variables if v != ref_name]
 
-                    print(f"      Переменных: {len(variables)} (индексная: {ref_name})")
-                    logger.info(f"      Найдено переменных: {len(variables)} (индексная кривая: {ref_name})")
-                    logger.info(f"      Переменных для экспорта: {len(variables_to_export)}")
+                    print(f"      Variables: {len(variables)} (index: {ref_name})")
+                    logger.info(f"      Variables found: {len(variables)} (index curve: {ref_name})")
+                    logger.info(f"      Variables to export: {len(variables_to_export)}")
 
                     for var_idx, variable_name in enumerate(variables_to_export, 1):
                         try:
@@ -711,24 +703,24 @@ def welllogml_write_from_techlog(output_dir: str = None):
                                     msg += f" [{var_unit}]"
                                 if var_type:
                                     msg += f" ({var_type})"
-                                msg += f" - {data_points:,} значений"
+                                msg += f" - {data_points:,} values"
 
                                 print(f"    ✓ {msg}")
-                                logger.info(f"        Загружена переменная: {msg}")
+                                logger.info(f"        Variable loaded: {msg}")
                             else:
-                                msg = f"      [{var_idx}/{len(variables_to_export)}] {variable_name} ({var_type}) - нет данных"
+                                msg = f"      [{var_idx}/{len(variables_to_export)}] {variable_name} ({var_type}) - no data"
                                 print(f"    ⚠ {msg}")
                                 logger.warning(f"        {msg}")
-                                logger.warning(f"          Возможные причины: db.variableLoad() вернула None или пустой результат")
+                                logger.warning(f"          Possible cause: db.variableLoad() returned None or empty result")
                         except Exception as e:
-                            error_msg = f"      [{var_idx}/{len(variables_to_export)}] Ошибка при загрузке {variable_name} ({var_type if 'var_type' in locals() else '?'}): {e}"
+                            error_msg = f"      [{var_idx}/{len(variables_to_export)}] Error loading {variable_name} ({var_type if 'var_type' in locals() else '?'}): {e}"
                             print(f"    ✗ {error_msg}")
                             logger.error(f"        {error_msg}")
 
-                logger.info(f"  Статистика по скважине {well_name}:")
-                logger.info(f"    - Датасетов: {len(datasets)}")
-                logger.info(f"    - Переменных: {well_total_vars}")
-                logger.info(f"    - Точек данных: {well_total_data_points:,}")
+                logger.info(f"  Stats for well {well_name}:")
+                logger.info(f"    - Datasets: {len(datasets)}")
+                logger.info(f"    - Variables: {well_total_vars}")
+                logger.info(f"    - Data points: {well_total_data_points:,}")
 
                 well_name_clean = str(well_name).strip()
                 for ch in r'\/:*?"<>|':
@@ -739,39 +731,39 @@ def welllogml_write_from_techlog(output_dir: str = None):
 
                 file_exists = os.path.exists(output_filename)
 
-                print(f"\n  Сохранение файла: {well_name_clean}_{timestamp_str}.json (скважина «{well_name}»)")
-                logger.info(f"\n  Сохранение результатов:")
-                logger.info(f"    Файл: {output_filename}")
-                logger.info(f"    Существует: {'Да' if file_exists else 'Нет'}")
+                print(f"\n  Saving: {well_name_clean}_{timestamp_str}.json (well '{well_name}')")
+                logger.info(f"\n  Saving results:")
+                logger.info(f"    File: {output_filename}")
+                logger.info(f"    Exists: {'Yes' if file_exists else 'No'}")
 
                 generator.save(output_filename)
 
                 if file_exists:
                     stats['updated'] += 1
-                    logger.info(f"    Результат: ОБНОВЛЕН")
+                    logger.info(f"    Result: UPDATED")
                 else:
                     stats['created'] += 1
-                    logger.info(f"    Результат: СОЗДАН")
+                    logger.info(f"    Result: CREATED")
 
                 well_end_time = datetime.now()
                 well_duration = (well_end_time - well_start_time).total_seconds()
 
-                logger.info(f"\n  Завершена обработка скважины: {well_name}")
-                logger.info(f"    Время окончания: {well_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                logger.info(f"    Время выполнения: {well_duration:.2f} сек")
+                logger.info(f"\n  Finished well: {well_name}")
+                logger.info(f"    End time: {well_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"    Duration: {well_duration:.2f} s")
                 logger.info(f"{'='*60}\n")
 
-                print(f"\n  ⏱ Время обработки: {well_duration:.2f} сек")
+                print(f"\n  ⏱ Duration: {well_duration:.2f} s")
 
             except Exception as e:
                 stats['errors'] += 1
                 well_end_time = datetime.now()
                 well_duration = (well_end_time - well_start_time).total_seconds()
 
-                error_msg = f"Ошибка при обработке скважины {well_name}: {e}"
+                error_msg = f"Error processing well {well_name}: {e}"
                 print(f"\n✗ {error_msg}")
                 logger.error(f"\n✗ {error_msg}")
-                logger.error(f"  Время выполнения до ошибки: {well_duration:.2f} сек")
+                logger.error(f"  Duration before error: {well_duration:.2f} s")
                 logger.error(f"{'='*60}\n")
 
                 import traceback
@@ -782,43 +774,43 @@ def welllogml_write_from_techlog(output_dir: str = None):
         export_duration = (export_end_time - export_start_time).total_seconds()
 
         print(f"\n{'='*80}")
-        print(f"СТАТИСТИКА ЭКСПОРТА:")
+        print(f"EXPORT SUMMARY:")
         print(f"{'='*80}")
-        print(f"Всего скважин:                   {stats['total']:>4}")
-        print(f"Создано новых файлов:            {stats['created']:>4}")
-        print(f"Обновлено файлов:                {stats['updated']:>4}")
-        print(f"Ошибок:                          {stats['errors']:>4}")
-        print(f"Скважин без ID (файл не создан): {stats['wells_skipped_no_id']:>4}")
-        print(f"Датасетов без ID (пропущено):    {stats['datasets_skipped_no_id']:>4}")
-        print(f"Переменных без ID (пропущено):   {stats['variables_skipped_no_id']:>4}")
+        print(f"Total wells:                     {stats['total']:>4}")
+        print(f"New files created:               {stats['created']:>4}")
+        print(f"Files updated:                   {stats['updated']:>4}")
+        print(f"Errors:                          {stats['errors']:>4}")
+        print(f"Wells skipped (no ID):           {stats['wells_skipped_no_id']:>4}")
+        print(f"Datasets skipped (no ID):        {stats['datasets_skipped_no_id']:>4}")
+        print(f"Variables skipped (no ID):       {stats['variables_skipped_no_id']:>4}")
         print(f"{'='*80}")
-        print(f"Время начала:              {export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Время окончания:           {export_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Общее время выполнения:    {export_duration:.2f} сек ({export_duration/60:.2f} мин)")
+        print(f"Start time:          {export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"End time:            {export_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Total duration:      {export_duration:.2f} s ({export_duration/60:.2f} min)")
         if stats['total'] > 0:
             avg_time = export_duration / stats['total']
-            print(f"Среднее время на скважину: {avg_time:.2f} сек")
+            print(f"Avg time per well:   {avg_time:.2f} s")
         print(f"{'='*80}")
-        print(f"Лог-файл: {log_filename}")
+        print(f"Log file: {log_filename}")
 
         logger.info(f"\n{'='*60}")
-        logger.info(f"ЭКСПОРТ ЗАВЕРШЕН")
+        logger.info(f"EXPORT COMPLETE")
         logger.info(f"{'='*60}")
-        logger.info(f"Статистика:")
-        logger.info(f"  Всего скважин: {stats['total']}")
-        logger.info(f"  Создано новых файлов: {stats['created']}")
-        logger.info(f"  Обновлено файлов: {stats['updated']}")
-        logger.info(f"  Ошибок: {stats['errors']}")
-        logger.info(f"  Скважин без ID (файл не создан): {stats['wells_skipped_no_id']}")
-        logger.info(f"  Датасетов без ID (пропущено): {stats['datasets_skipped_no_id']}")
-        logger.info(f"  Переменных без ID (пропущено): {stats['variables_skipped_no_id']}")
-        logger.info(f"\nВремя выполнения:")
-        logger.info(f"  Начало: {export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"  Окончание: {export_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"  Общее время: {export_duration:.2f} сек ({export_duration/60:.2f} мин)")
+        logger.info(f"Summary:")
+        logger.info(f"  Total wells: {stats['total']}")
+        logger.info(f"  New files created: {stats['created']}")
+        logger.info(f"  Files updated: {stats['updated']}")
+        logger.info(f"  Errors: {stats['errors']}")
+        logger.info(f"  Wells skipped (no ID): {stats['wells_skipped_no_id']}")
+        logger.info(f"  Datasets skipped (no ID): {stats['datasets_skipped_no_id']}")
+        logger.info(f"  Variables skipped (no ID): {stats['variables_skipped_no_id']}")
+        logger.info(f"\nDuration:")
+        logger.info(f"  Start: {export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"  End: {export_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"  Total: {export_duration:.2f} s ({export_duration/60:.2f} min)")
         if stats['total'] > 0:
             avg_time = export_duration / stats['total']
-            logger.info(f"  Среднее время на скважину: {avg_time:.2f} сек")
+            logger.info(f"  Avg per well: {avg_time:.2f} s")
         logger.info(f"{'='*60}")
 
         for handler in logger.handlers[:]:
