@@ -41,6 +41,8 @@ Notes:
 - Malformed JSON with leading zeros in numbers is automatically fixed before parsing
 - Optional depth conversion to metres (CONVERT_DEPTH_TO_METERS parameter)
   supports: ft, m, km, in and other units
+- Streaming mode: if ijson is installed, datasets and curves are loaded one at a time
+  to minimise memory usage. Otherwise falls back to standard json.load.
 """
 
 import sys
@@ -59,6 +61,14 @@ from client.server.remote_server import RemoteServer
 import numpy as np
 import json
 import glob
+
+# Try importing ijson for true streaming of large JSON files
+_IJSON_AVAILABLE = False
+try:
+    import ijson
+    _IJSON_AVAILABLE = True
+except ImportError:
+    pass
 
 
 # ========================
@@ -100,6 +110,7 @@ def replace_null_values(data, null_value=NULL_VALUE):
     Replace null values in an array with np.nan.
 
     Handles both string ("-9999") and numeric (-9999) null values.
+    Optimised to avoid unnecessary copies for already-float arrays.
 
     Parameters:
     - data: numpy array or list (1D or 2D)
@@ -111,54 +122,33 @@ def replace_null_values(data, null_value=NULL_VALUE):
     if not isinstance(data, np.ndarray):
         data = np.array(data)
 
-    # Try direct float conversion first
-    try:
-        data_float = data.astype(float, copy=True)
+    # Fast path: already float — try in-place without copy
+    if data.dtype.kind == 'f':
+        mask = np.isclose(data, null_value, rtol=1e-5, atol=1e-8)
+        if np.any(mask):
+            data = data.copy()
+            data[mask] = np.nan
+        return data
 
-        # Replace values close to null_value with np.nan using isclose
-        # Works for -9999, -9999.0, -9999e0, etc.
+    # Convert to float without forced copy if possible
+    try:
+        data_float = data.astype(float, copy=False)
         mask = np.isclose(data_float, null_value, rtol=1e-5, atol=1e-8)
         data_float[mask] = np.nan
-
         return data_float
-
     except (ValueError, TypeError):
-        # Direct conversion failed — fall through to string handling
         pass
 
-    # Handle string data: replace null strings with 'nan' before converting
+    # Slow path for mixed strings / objects
+    null_str = str(null_value).strip()
+    data_obj = data.astype(object, copy=False)
+    flat = data_obj.ravel()
     try:
-        null_str = str(null_value)  # e.g. "-9999.0"
-
-        data_obj = data.astype(object, copy=True)
-        original_shape = data_obj.shape
-
-        def is_null_value(val):
-            try:
-                return np.isclose(float(val), float(null_value), rtol=1e-5, atol=1e-8)
-            except (ValueError, TypeError):
-                return str(val).strip() == null_str.strip()
-
-        flat_data = data_obj.ravel()
-        null_mask = np.zeros(len(flat_data), dtype=bool)
-
-        # Fast path: try as float
-        try:
-            null_mask = np.isclose(flat_data.astype(float), float(null_value), rtol=1e-5, atol=1e-8)
-        except (ValueError, TypeError):
-            # Slow path: check element by element
-            for i in range(len(flat_data)):
-                if is_null_value(flat_data[i]):
-                    null_mask[i] = True
-
-        flat_data[null_mask] = np.nan
-
-        data_obj = flat_data.reshape(original_shape)
-        return data_obj.astype(float)
-
-    except Exception as e:
-        # Nothing worked — return data unchanged
-        return data
+        mask = np.isclose(flat.astype(float), float(null_value), rtol=1e-5, atol=1e-8)
+    except (ValueError, TypeError):
+        mask = np.array([str(v).strip() == null_str for v in flat], dtype=bool)
+    flat[mask] = np.nan
+    return data_obj.astype(float)
 
 
 def load_json_file(filepath):
@@ -175,24 +165,18 @@ def load_json_file(filepath):
     """
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        # Try parsing as-is
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as json_err:
-            # If leading-zero numbers are the problem, attempt to fix them
-            if 'leading zeros' in str(json_err) or 'Expecting' in str(json_err):
-                print(f'  ℹ Attempting to fix malformed JSON with leading zeros...')
-                fixed_content = content
-                import re
-                # Fix ", 0N" → ", N" inside arrays
-                fixed_content = re.sub(r',\s+0(\d)', r', \1', fixed_content)
-                # Fix "[0N" → "[N" for the first element
-                fixed_content = re.sub(r'\[\s*0(\d)', r'[\1', fixed_content)
-                return json.loads(fixed_content)
-            else:
-                raise
+            return json.load(f)
+    except json.JSONDecodeError as json_err:
+        if 'leading zeros' in str(json_err) or 'Expecting' in str(json_err):
+            print(f'  ℹ Attempting to fix malformed JSON with leading zeros...')
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            import re
+            fixed_content = re.sub(r',\s+0(\d)', r', \1', content)
+            fixed_content = re.sub(r'\[\s*0(\d)', r'[\1', fixed_content)
+            return json.loads(fixed_content)
+        else:
+            raise
     except Exception as e:
         print(f'✗ Error reading file {filepath}: {e}')
         return None
@@ -302,29 +286,250 @@ def apply_properties(obj, properties_dict):
     return 0
 
 
-def import_well_from_json(prj, filepath):
-    """
-    Import one well from a JSON file.
+# ---------------------------------------------------------------------------
+# ijson streaming helpers (used only when ijson is installed)
+# ---------------------------------------------------------------------------
 
-    Parameters:
-    - prj: WAI DB Project object
-    - filepath: path to the JSON file
+def _get_well_name(filepath):
+    """Extract well name from a WellLogML JSON file using ijson."""
+    with open(filepath, 'rb') as f:
+        for key, value in ijson.kvitems(f, 'WellLogML'):
+            if key != 'DocumentInformation':
+                return key
+    return None
 
-    Returns:
-    - dict: import statistics for this file
-      { 'well': name, 'file': filename, 'datasets_ok': count, 'curves_ok': count,
-        'curves_skipped': count, 'errors': count, 'error_list': list }
-    """
-    stats = {
-        'well': None,
-        'file': os.path.basename(filepath),
-        'datasets_ok': 0,
-        'curves_ok': 0,
-        'curves_skipped': 0,
-        'errors': 0,
-        'error_list': []
-    }
 
+def _load_well_properties(well_name, filepath):
+    """Load wellProperties dict using ijson."""
+    props = {}
+    try:
+        with open(filepath, 'rb') as f:
+            for key, value in ijson.kvitems(f, f'WellLogML.{well_name}.wellProperties'):
+                props[key] = value
+    except Exception:
+        pass
+    return props
+
+
+def _load_dataset_index(well_name, dataset_name, filepath):
+    """Load index curve metadata + data for a single dataset using ijson."""
+    prefix = f'WellLogML.{well_name}.datasets.{dataset_name}.index'
+    try:
+        with open(filepath, 'rb') as f:
+            it = ijson.items(f, prefix)
+            return next(it)
+    except StopIteration:
+        return None
+
+
+def _stream_dataset_variables(well_name, dataset_name, filepath):
+    """Yield (var_name, var_info) pairs one at a time using ijson."""
+    prefix = f'WellLogML.{well_name}.datasets.{dataset_name}.variables'
+    with open(filepath, 'rb') as f:
+        for var_name, var_info in ijson.kvitems(f, prefix):
+            yield var_name, var_info
+
+
+# ---------------------------------------------------------------------------
+# Import functions
+# ---------------------------------------------------------------------------
+
+def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats):
+    """Process a single variable and save it to WAI DB."""
+    try:
+        var_data_raw = var_info.get('variableData', [])
+        var_unit = var_info.get('variableUnit', 'unitless')
+        var_family = var_info.get('variableFamily', '')
+        var_type = var_info.get('variableType', 'Continu')
+        null_value = var_info.get('nullValue', NULL_VALUE)
+        var_properties = var_info.get('variableProperties', {})
+
+        # Guard: np.array('string') would split the string into individual characters
+        if isinstance(var_data_raw, (str, int, float, bool)):
+            var_data_raw = [var_data_raw]
+
+        var_values = np.array(var_data_raw)
+        del var_data_raw
+
+        # Detect accidental char-array from a single string value
+        if var_values.dtype.kind == 'U' and len(var_values) > 1:
+            if all(len(str(v)) == 1 for v in var_values):
+                print(f'        ⚠ {var_name} ({var_type}): possible string-to-char-array conversion (skipped)')
+                stats['curves_skipped'] += 1
+                del var_values
+                return
+
+        if len(var_values) == 0:
+            print(f'        ⊘ {var_name} ({var_type}): no data (skipped)')
+            stats['curves_skipped'] += 1
+            del var_values
+            return
+
+        # Length must match the index, or be an exact multiple (multi-column log)
+        if len(var_values) != len(index_data):
+            if len(var_values) > 0 and len(var_values) % len(index_data) == 0:
+                num_columns = len(var_values) // len(index_data)
+                if num_columns > 1:
+                    print(f'        ℹ {var_name}: multi-column data — reshaping {len(var_values)} → ({len(index_data)}×{num_columns})')
+                    try:
+                        reshaped = var_values.reshape((num_columns, len(index_data))).T
+                        print(f'          After reshape: shape {reshaped.shape}, dtype {reshaped.dtype}')
+                        var_values = reshaped
+                    except Exception as e:
+                        print(f'        ✗ {var_name}: reshape error: {e}')
+                        stats['curves_skipped'] += 1
+                        del var_values
+                        return
+                else:
+                    print(f'        - {var_name}: data length {len(var_values)} does not match index {len(index_data)} (skipped)')
+                    stats['curves_skipped'] += 1
+                    del var_values
+                    return
+            else:
+                print(f'        - {var_name}: data length {len(var_values)} does not match index {len(index_data)}, not a multiple (skipped)')
+                stats['curves_skipped'] += 1
+                del var_values
+                return
+
+        var_values = replace_null_values(var_values, null_value)
+
+        if var_values.ndim == 2:
+            print(f'          After replace_null_values: shape {var_values.shape}, NaN count {np.sum(np.isnan(var_values))}')
+
+        original_family = var_family
+
+        if not USE_FAMILY or not var_family:
+            try:
+                mnemonic_info = prj.family_assigner.assign_family(var_name, var_unit)
+                var_family = mnemonic_info.family
+                if not USE_FAMILY:
+                    print(f'        ℹ {var_name}: family auto-detected = {var_family}')
+            except Exception:
+                var_family = original_family
+                if not USE_FAMILY and not var_family:
+                    print(f'        ⚠ {var_name}: could not determine family, left empty')
+
+        log = well.logs.create(
+            name=var_name,
+            group=[dataset_name],
+            values_family=var_family,
+            values_unit=var_unit,
+            reference_unit=index_unit
+        )
+
+        if var_properties:
+            props_count = apply_properties(log, var_properties)
+            if props_count > 0:
+                print(f'        ℹ Log properties loaded: {props_count}')
+
+        if var_values.ndim == 2:
+            num_nan = np.sum(np.isnan(var_values))
+            print(f'          Before set_rvalues: index {index_data.shape}, values {var_values.shape}, NaN={num_nan}')
+            if var_values.shape[0] != len(index_data):
+                print(f'          ✗ ERROR: shape mismatch! index={len(index_data)}, values[0]={var_values.shape[0]}')
+                stats['curves_skipped'] += 1
+                del var_values
+                return
+
+        log.set_rvalues(index_data, var_values)
+        log.save()
+
+        if var_values.ndim == 2:
+            print(f'        ✓ {var_name} ({var_family}, {var_unit}) {var_values.shape[0]} points × {var_values.shape[1]} columns')
+        else:
+            print(f'        ✓ {var_name} ({var_family}, {var_unit}, {len(var_values)} points)')
+        stats['curves_ok'] += 1
+
+        del var_values
+
+    except Exception as e:
+        err_msg = f'{var_name}: {e}'
+        print(f'        ✗ {err_msg}')
+        stats['error_list'].append(err_msg)
+        stats['errors'] += 1
+
+
+def _import_well_streaming(prj, filepath, stats):
+    """Import a well using ijson streaming (low memory footprint)."""
+    well_name = _get_well_name(filepath)
+    if not well_name:
+        stats['error_list'].append('Well name not found')
+        return stats
+
+    stats['well'] = well_name
+    print(f'\n  Processing well: {well_name}')
+
+    try:
+        well = prj.wells.get_by_name(well_name, create_if_absent=True)
+        well.save()
+    except Exception as e:
+        stats['error_list'].append(f'Error creating well: {e}')
+        stats['errors'] += 1
+        return stats
+
+    well_properties = _load_well_properties(well_name, filepath)
+    if well_properties:
+        props_count = apply_properties(well, well_properties)
+        if props_count > 0:
+            well.save()
+            print(f'    ℹ Well properties loaded: {props_count}')
+    print(f'    ✓ Well retrieved/created')
+
+    # Collect dataset names without materialising their contents
+    dataset_names = []
+    with open(filepath, 'rb') as f:
+        prefix = f'WellLogML.{well_name}.datasets'
+        for p, event, value in ijson.parse(f):
+            if p == prefix and event == 'map_key':
+                dataset_names.append(value)
+
+    for dataset_name in dataset_names:
+        if dataset_name in SKIP_DATASETS:
+            print(f'    ⊘ Dataset skipped: {dataset_name}')
+            stats['curves_skipped'] += 1
+            continue
+
+        print(f'    Dataset: {dataset_name}')
+
+        index = _load_dataset_index(well_name, dataset_name, filepath)
+        if not index:
+            print(f'      ✗ No index curve (depth)')
+            stats['error_list'].append(f'{dataset_name}: no index curve')
+            stats['errors'] += 1
+            continue
+
+        index_name = index.get('name', 'MD')
+        index_unit = index.get('variableUnit', 'm')
+        index_data_raw = index.get('variableData', [])
+        index_data = np.array(index_data_raw)
+        del index_data_raw, index
+
+        if len(index_data) == 0:
+            print(f'      ✗ Index curve is empty')
+            stats['error_list'].append(f'{dataset_name}: index curve is empty')
+            stats['errors'] += 1
+            del index_data
+            continue
+
+        reference_unit = index_unit
+        if CONVERT_DEPTH_TO_METERS and index_unit.lower() != 'm':
+            index_data, reference_unit, factor = convert_depth_to_meters(index_data, index_unit)
+            print(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit} → {reference_unit}, factor: {factor})')
+        else:
+            print(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit})')
+
+        for var_name, var_info in _stream_dataset_variables(well_name, dataset_name, filepath):
+            _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats)
+            del var_info
+
+        stats['datasets_ok'] += 1
+        del index_data
+
+    return stats
+
+
+def _import_well_fallback(prj, filepath, stats):
+    """Fallback import using standard json.load (loads the entire file into memory)."""
     data = load_json_file(filepath)
     if data is None:
         return stats
@@ -361,12 +566,15 @@ def import_well_from_json(prj, filepath):
         stats['errors'] += 1
         return stats
 
-    datasets = well_data.get('datasets', {})
-    for dataset_name, dataset in datasets.items():
+    # Pop datasets so they can be freed as we go
+    datasets = well_data.pop('datasets', {})
+    for dataset_name in list(datasets.keys()):
+        dataset = datasets.pop(dataset_name)
 
         if dataset_name in SKIP_DATASETS:
             print(f'    ⊘ Dataset skipped: {dataset_name}')
             stats['curves_skipped'] += 1
+            del dataset
             continue
 
         print(f'    Dataset: {dataset_name}')
@@ -376,6 +584,7 @@ def import_well_from_json(prj, filepath):
             print(f'      ✗ No index curve (depth)')
             stats['error_list'].append(f'{dataset_name}: no index curve')
             stats['errors'] += 1
+            del dataset
             continue
 
         index_name = index.get('name', 'MD')
@@ -386,6 +595,7 @@ def import_well_from_json(prj, filepath):
             print(f'      ✗ Index curve is empty')
             stats['error_list'].append(f'{dataset_name}: index curve is empty')
             stats['errors'] += 1
+            del dataset
             continue
 
         reference_unit = index_unit
@@ -395,125 +605,60 @@ def import_well_from_json(prj, filepath):
         else:
             print(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit})')
 
-        variables = dataset.get('variables', {})
-        for var_name, var_data in variables.items():
-
-            try:
-                var_data_raw = var_data.get('variableData', [])
-                var_unit = var_data.get('variableUnit', 'unitless')
-                var_family = var_data.get('variableFamily', '')
-                var_type = var_data.get('variableType', 'Continu')
-                null_value = var_data.get('nullValue', NULL_VALUE)
-
-                # Guard: np.array('string') would split the string into individual characters
-                if isinstance(var_data_raw, (str, int, float, bool)):
-                    var_data_raw = [var_data_raw]
-
-                var_values = np.array(var_data_raw)
-
-                # Detect accidental char-array from a single string value
-                if var_values.dtype.kind == 'U' and len(var_values) > 1:
-                    if all(len(str(v)) == 1 for v in var_values):
-                        print(f'        ⚠ {var_name} ({var_type}): possible string-to-char-array conversion (skipped)')
-                        stats['curves_skipped'] += 1
-                        continue
-
-                if len(var_values) == 0:
-                    # Likely an annotation (Zone Name, Marker Name) or empty field
-                    print(f'        ⊘ {var_name} ({var_type}): no data (skipped)')
-                    stats['curves_skipped'] += 1
-                    continue
-
-                # Length must match the index, or be an exact multiple (multi-column log)
-                if len(var_values) != len(index_data):
-                    if len(var_values) > 0 and len(var_values) % len(index_data) == 0:
-                        num_columns = len(var_values) // len(index_data)
-                        if num_columns > 1:
-                            print(f'        ℹ {var_name}: multi-column data — reshaping {len(var_values)} → ({len(index_data)}\xd7{num_columns})')
-                            try:
-                                # Data is column-major: [col1_all, col2_all, col3_all]
-                                # Reshape to (num_columns, num_points) then transpose to (num_points, num_columns)
-                                reshaped = var_values.reshape((num_columns, len(index_data))).T
-                                print(f'          After reshape: shape {reshaped.shape}, dtype {reshaped.dtype}')
-                                var_values = reshaped
-                            except Exception as e:
-                                print(f'        ✗ {var_name}: reshape error: {e}')
-                                stats['curves_skipped'] += 1
-                                continue
-                        else:
-                            print(f'        - {var_name}: data length {len(var_values)} does not match index {len(index_data)} (skipped)')
-                            stats['curves_skipped'] += 1
-                            continue
-                    else:
-                        print(f'        - {var_name}: data length {len(var_values)} does not match index {len(index_data)}, not a multiple (skipped)')
-                        stats['curves_skipped'] += 1
-                        continue
-
-                var_values = replace_null_values(var_values, null_value)
-
-                if var_values.ndim == 2:
-                    print(f'          After replace_null_values: shape {var_values.shape}, NaN count {np.sum(np.isnan(var_values))}')
-
-                original_family = var_family
-
-                if not USE_FAMILY or not var_family:
-                    try:
-                        mnemonic_info = prj.family_assigner.assign_family(var_name, var_unit)
-                        var_family = mnemonic_info.family
-                        if not USE_FAMILY:
-                            print(f'        ℹ {var_name}: family auto-detected = {var_family}')
-                    except Exception:
-                        var_family = original_family
-                        if not USE_FAMILY and not var_family:
-                            print(f'        ⚠ {var_name}: could not determine family, left empty')
-
-                log = well.logs.create(
-                    name=var_name,
-                    group=[dataset_name],        # group = dataset name
-                    values_family=var_family,
-                    values_unit=var_unit,
-                    reference_unit=index_unit    # depth unit from the index curve
-                )
-
-                var_properties = var_data.get('variableProperties', {})
-                if var_properties:
-                    props_count = apply_properties(log, var_properties)
-                    if props_count > 0:
-                        print(f'        ℹ Log properties loaded: {props_count}')
-
-                if var_values.ndim == 2:
-                    num_nan = np.sum(np.isnan(var_values))
-                    print(f'          Before set_rvalues: index {index_data.shape}, values {var_values.shape}, NaN={num_nan}')
-                    if var_values.shape[0] != len(index_data):
-                        print(f'          ✗ ERROR: shape mismatch! index={len(index_data)}, values[0]={var_values.shape[0]}')
-                        stats['curves_skipped'] += 1
-                        continue
-
-                log.set_rvalues(index_data, var_values)
-                log.save()
-
-                if var_values.ndim == 2:
-                    print(f'        ✓ {var_name} ({var_family}, {var_unit}) {var_values.shape[0]} points \xd7 {var_values.shape[1]} columns')
-                else:
-                    print(f'        ✓ {var_name} ({var_family}, {var_unit}, {len(var_values)} points)')
-                stats['curves_ok'] += 1
-
-            except Exception as e:
-                err_msg = f'{var_name}: {e}'
-                print(f'        ✗ {err_msg}')
-                stats['error_list'].append(err_msg)
-                stats['errors'] += 1
-                continue
+        # Pop variables so they can be freed as we go
+        variables = dataset.pop('variables', {})
+        for var_name in list(variables.keys()):
+            var_info = variables.pop(var_name)
+            _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats)
+            del var_info
 
         stats['datasets_ok'] += 1
+        del dataset, index_data
 
+    del data
     return stats
+
+
+def import_well_from_json(prj, filepath):
+    """
+    Import one well from a JSON file.
+
+    Parameters:
+    - prj: WAI DB Project object
+    - filepath: path to the JSON file
+
+    Returns:
+    - dict: import statistics for this file
+      { 'well': name, 'file': filename, 'datasets_ok': count, 'curves_ok': count,
+        'curves_skipped': count, 'errors': count, 'error_list': list }
+    """
+    stats = {
+        'well': None,
+        'file': os.path.basename(filepath),
+        'datasets_ok': 0,
+        'curves_ok': 0,
+        'curves_skipped': 0,
+        'errors': 0,
+        'error_list': []
+    }
+
+    if _IJSON_AVAILABLE:
+        try:
+            return _import_well_streaming(prj, filepath, stats)
+        except Exception as e:
+            print(f'  ⚠ Streaming parser failed ({e}), falling back to standard loader')
+
+    return _import_well_fallback(prj, filepath, stats)
 
 
 def main():
     """Main import function."""
     print('=' * 70)
     print('WellLogML JSON → WAI DB Importer')
+    if _IJSON_AVAILABLE:
+        print('Mode: streaming (ijson)')
+    else:
+        print('Mode: standard (install "ijson" for low-memory streaming)')
     print('=' * 70)
 
     print(f'\nConnecting to server...')

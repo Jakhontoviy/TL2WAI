@@ -14,14 +14,18 @@ TECHLOG_JSON_LOG_DIR = os.path.join(TECHLOG_JSON_ROOT, 'log')
 
 
 class WellLogMLGenerator:
-    """Generates WellLogML JSON files from Techlog data."""
+    """Generates WellLogML JSON files from Techlog data using true streaming."""
 
     def __init__(self, techlog_version: str = "2023.1", logger: logging.Logger = None):
         self.techlog_version = techlog_version
-        self.data = None
         self.logger = logger
         self.current_dataset_name = None
         self.current_well_name = None
+        self.f = None
+        self.filename = None
+        self._tmp_path = None
+        self._first_dataset = True
+        self._first_variable = True
 
     @staticmethod
     def _parse_history_item(history_string: str) -> Tuple[str, str, str]:
@@ -64,7 +68,6 @@ class WellLogMLGenerator:
     def _get_username(self) -> str:
         """Return the current OS username."""
         return os.getenv('USERNAME', os.getenv('USER', 'user'))
-
 
     @staticmethod
     def _is_html_content(text: str) -> Tuple[bool, str]:
@@ -111,17 +114,64 @@ class WellLogMLGenerator:
         if data is None or len(data) == 0:
             return 'empty'
 
+        # Fast path for numpy numeric arrays (most common case for curves)
+        if isinstance(data, np.ndarray):
+            if np.issubdtype(data.dtype, np.number):
+                return 'numeric'
+            # Fast path for fixed-width string dtypes
+            if np.issubdtype(data.dtype, np.character):
+                has_numeric = False
+                has_string = False
+                for val in np.nditer(data, flags=['refs_ok']):
+                    v = val.item()
+                    if v is None:
+                        continue
+                    try:
+                        float(v)
+                        has_numeric = True
+                    except (ValueError, TypeError):
+                        has_string = True
+                    if has_string and has_numeric:
+                        return 'mixed'
+                return 'numeric' if has_numeric else 'string'
+            # Object arrays and other dtypes — scan element-wise
+            flat = data.flat
+            has_numeric = False
+            has_string = False
+            for val in flat:
+                if val is None:
+                    continue
+                if isinstance(val, (int, float, np.integer, np.floating)):
+                    has_numeric = True
+                    continue
+                if isinstance(val, str):
+                    try:
+                        float(val)
+                        has_numeric = True
+                    except (ValueError, TypeError):
+                        has_string = True
+                    continue
+                has_string = True
+                if has_numeric and has_string:
+                    return 'mixed'
+            if has_string and has_numeric:
+                return 'mixed'
+            elif has_string:
+                return 'string'
+            elif has_numeric:
+                return 'numeric'
+            else:
+                return 'unknown'
+
+        # Fallback for Python lists / other iterables
         has_numeric = False
         has_string = False
-
         for val in data:
             if val is None:
                 continue
-
             if isinstance(val, (int, float, np.integer, np.floating)):
                 has_numeric = True
                 continue
-
             if isinstance(val, str):
                 try:
                     float(val)
@@ -129,7 +179,6 @@ class WellLogMLGenerator:
                 except (ValueError, TypeError):
                     has_string = True
                 continue
-
             has_string = True
 
         if has_string and has_numeric:
@@ -140,8 +189,6 @@ class WellLogMLGenerator:
             return 'numeric'
         else:
             return 'unknown'
-
-
 
     def _log(self, message: str, level: str = 'info'):
         if self.logger:
@@ -193,58 +240,162 @@ class WellLogMLGenerator:
                     })
         return history
 
-    def create_document(self, well_name: str) -> bool:
-        """Create the base document structure for a well."""
+    def _write_json_value_inline(self, value):
+        """Write a single JSON scalar value to the open file."""
+        if value is None:
+            self.f.write('null')
+        elif isinstance(value, bool):
+            self.f.write('true' if value else 'false')
+        elif isinstance(value, (int, float, np.integer, np.floating)):
+            if isinstance(value, (float, np.floating)):
+                if np.isnan(value):
+                    self.f.write('null')
+                else:
+                    self.f.write(json.dumps(float(value)))
+            else:
+                self.f.write(str(int(value)))
+        elif isinstance(value, str):
+            self.f.write(json.dumps(value, ensure_ascii=False))
+        else:
+            self.f.write(json.dumps(value, ensure_ascii=False))
+
+    def _write_dict_inline(self, d, base_indent):
+        """Write a dict inline with indentation, streaming directly to file."""
+        self.f.write('{\n')
+        items = list(d.items())
+        next_indent = base_indent + '  '
+        for i, (k, v) in enumerate(items):
+            comma = ',' if i < len(items) - 1 else ''
+            self.f.write(f'{next_indent}{json.dumps(k, ensure_ascii=False)}: ')
+            if isinstance(v, dict):
+                self._write_dict_inline(v, next_indent)
+            elif isinstance(v, list):
+                self._write_list_inline(v, next_indent)
+            else:
+                self._write_json_value_inline(v)
+            self.f.write(f'{comma}\n')
+        self.f.write(f'{base_indent}}}')
+
+    def _write_list_inline(self, lst, base_indent):
+        """Write a list inline with indentation, streaming directly to file."""
+        self.f.write('[\n')
+        next_indent = base_indent + '  '
+        for i, item in enumerate(lst):
+            comma = ',' if i < len(lst) - 1 else ''
+            self.f.write(f'{next_indent}')
+            if isinstance(item, dict):
+                self._write_dict_inline(item, next_indent)
+            elif isinstance(item, list):
+                self._write_list_inline(item, next_indent)
+            else:
+                self._write_json_value_inline(item)
+            self.f.write(f'{comma}\n')
+        self.f.write(f'{base_indent}]')
+
+    def _write_numeric_array_compact(self, arr, null_value=None):
+        """Write a numeric array in compact [1, 2, 3] format, streaming.
+
+        If null_value is provided, NaN and values equal to null_value are
+        replaced with null_value during writing (no full-array copy).
+        """
+        self.f.write('[')
+        n = len(arr)
+        if n > 0:
+            chunk_size = 4096
+            first = True
+            for i in range(0, n, chunk_size):
+                chunk = arr[i:i+chunk_size]
+                parts = []
+                for val in chunk:
+                    if not first:
+                        parts.append(', ')
+                    first = False
+                    v = float(val)
+                    if null_value is not None and (np.isnan(v) or v == null_value):
+                        parts.append(json.dumps(float(null_value)))
+                    else:
+                        parts.append(json.dumps(v))
+                self.f.write(''.join(parts))
+        self.f.write(']')
+
+    def _write_string_array_compact(self, arr):
+        """Write a string array in compact ["a", "b"] format, streaming."""
+        self.f.write('[')
+        n = len(arr)
+        if n > 0:
+            chunk_size = 4096
+            first = True
+            for i in range(0, n, chunk_size):
+                chunk = arr[i:i+chunk_size]
+                parts = []
+                for val in chunk:
+                    if not first:
+                        parts.append(', ')
+                    first = False
+                    parts.append(json.dumps(str(val) if val is not None else '', ensure_ascii=False))
+                self.f.write(''.join(parts))
+        self.f.write(']')
+
+    def create_document(self, well_name: str, filename: str) -> bool:
+        """Create the base document structure and open the output file for streaming."""
         try:
             well_name_value = db.wellName(well_name)
         except Exception:
             well_name_value = well_name
 
         self.current_well_name = well_name_value
+        self.filename = filename
 
-        self.data = {
-            "WellLogML": {
-                "DocumentInformation": {
-                    "dtdVersion": {
-                        "@extended": "no",
-                        "@number": "1.0",
-                        "#text": "ContinuFile"
-                    },
-                    "FileCreationInformation": {
-                        "softwareName": {
-                            "@version": self.techlog_version,
-                            "#text": "Techlog"
-                        }
-                    }
-                },
-                well_name_value: {}
-            }
-        }
+        target_dir = os.path.dirname(os.path.abspath(filename))
+        fd, self._tmp_path = tempfile.mkstemp(dir=target_dir, suffix='.tmp')
+        self.f = os.fdopen(fd, 'w', encoding='utf-8', buffering=65536)
 
-        well_info = self.data["WellLogML"][well_name_value]
+        # Root and DocumentInformation
+        self.f.write('{\n')
+        self.f.write('  "WellLogML": {\n')
+        self.f.write('    "DocumentInformation": {\n')
+        self.f.write('      "dtdVersion": {\n')
+        self.f.write('        "@extended": "no",\n')
+        self.f.write('        "@number": "1.0",\n')
+        self.f.write('        "#text": "ContinuFile"\n')
+        self.f.write('      },\n')
+        self.f.write('      "FileCreationInformation": {\n')
+        self.f.write('        "softwareName": {\n')
+        self.f.write(f'          "@version": {json.dumps(self.techlog_version, ensure_ascii=False)},\n')
+        self.f.write('          "#text": "Techlog"\n')
+        self.f.write('        }\n')
+        self.f.write('      }\n')
+        self.f.write('    },\n')
 
+        # Well start
+        self.f.write(f'    {json.dumps(well_name_value, ensure_ascii=False)}: {{\n')
+
+        # wellColor
         try:
             well_color = db.wellColor(well_name)
             if well_color:
-                well_info["wellColor"] = well_color
+                self.f.write(f'      "wellColor": {json.dumps(well_color, ensure_ascii=False)},\n')
         except Exception:
             pass
 
+        # wellGroup
         try:
             well_group = db.wellGroup(well_name)
             if well_group:
                 if isinstance(well_group, (list, tuple)):
-                    well_info["wellGroup"] = ', '.join(str(g) for g in well_group)
+                    well_group_str = ', '.join(str(g) for g in well_group)
                 else:
-                    well_info["wellGroup"] = str(well_group)
+                    well_group_str = str(well_group)
+                self.f.write(f'      "wellGroup": {json.dumps(well_group_str, ensure_ascii=False)},\n')
         except Exception:
             pass
 
-        well_info["wellProperties"] = {}
-
+        # wellProperties
+        self.f.write('      "wellProperties": ')
+        well_props = {}
         try:
             prop_list = db.wellPropertyList(well_name)
-            well_info["wellProperties"] = self._extract_properties(
+            well_props = self._extract_properties(
                 prop_list,
                 lambda p: db.wellPropertyValue(well_name, p),
                 lambda p: db.wellPropertyUnit(well_name, p),
@@ -252,25 +403,32 @@ class WellLogMLGenerator:
             )
         except Exception:
             pass
+        self._write_dict_inline(well_props, '      ')
+        self.f.write(',\n')
 
-        well_info["wellHistory"] = []
+        # wellHistory
+        self.f.write('      "wellHistory": ')
+        well_history = []
         try:
-            history = db.wellHistory(well_name)
-            well_info["wellHistory"] = self._process_history(history)
+            well_history = self._process_history(db.wellHistory(well_name))
         except Exception:
             pass
+        self._write_list_inline(well_history, '      ')
+        self.f.write(',\n')
 
-        well_info["datasets"] = {}
+        # datasets start
+        self.f.write('      "datasets": {\n')
+        self._first_dataset = True
         return True
 
     def add_dataset(self, well_name: str, dataset_name: str) -> bool:
         """
-        Add dataset information to the document.
+        Add dataset information to the document, streaming directly to file.
 
         Returns:
             True if the dataset was added successfully.
         """
-        if self.data is None:
+        if self.f is None:
             raise ValueError("Call create_document() before add_dataset()")
 
         try:
@@ -278,50 +436,60 @@ class WellLogMLGenerator:
         except Exception:
             dataset_name_value = dataset_name
 
-        dataset_dict = {}
+        self.current_dataset_name = dataset_name_value
 
+        if not self._first_dataset:
+            self.f.write(',\n')
+        self._first_dataset = False
+
+        self.f.write(f'        {json.dumps(dataset_name_value, ensure_ascii=False)}: {{\n')
+
+        # datasetType
         try:
             dataset_type = db.datasetType(well_name, dataset_name)
             if dataset_type:
-                dataset_dict["datasetType"] = str(dataset_type)
+                self.f.write(f'          "datasetType": {json.dumps(str(dataset_type), ensure_ascii=False)},\n')
         except Exception:
             pass
 
+        # datasetGroup
         try:
             dataset_group = db.datasetGroup(well_name, dataset_name)
             if dataset_group:
                 if isinstance(dataset_group, (list, tuple)):
-                    dataset_dict["datasetGroup"] = ', '.join(str(g) for g in dataset_group)
+                    dataset_group_str = ', '.join(str(g) for g in dataset_group)
                 else:
-                    dataset_dict["datasetGroup"] = str(dataset_group)
+                    dataset_group_str = str(dataset_group)
+                self.f.write(f'          "datasetGroup": {json.dumps(dataset_group_str, ensure_ascii=False)},\n')
         except Exception:
             pass
 
-        index_curve_info = None
-
+        # MeasurementDetails + index curve
         try:
             dataset_size = db.datasetSize(well_name, dataset_name)
             ref_name = db.referenceName(well_name, dataset_name)
 
-            dataset_dict["MeasurementDetails"] = {
-                "startIndex": 0,
-                "endIndex": dataset_size - 1 if dataset_size > 0 else 0
-            }
+            self.f.write('          "MeasurementDetails": {\n')
+            self.f.write('            "startIndex": 0,\n')
+            end_idx = dataset_size - 1 if dataset_size > 0 else 0
+            self.f.write(f'            "endIndex": {end_idx},\n')
 
             try:
                 ref_unit = db.variableUnit(well_name, dataset_name, ref_name)
                 sampling_rate = db.datasetSamplingRate(well_name, dataset_name, True, ref_unit)
-
-                dataset_dict["MeasurementDetails"]["evenSampling"] = {
-                    "@index_curve": ref_name,
-                    "stepIncrement": float(sampling_rate) if sampling_rate else 0.1
-                }
+                step = float(sampling_rate) if sampling_rate else 0.1
+                self.f.write('            "evenSampling": {\n')
+                self.f.write(f'              "@index_curve": {json.dumps(ref_name, ensure_ascii=False)},\n')
+                self.f.write(f'              "stepIncrement": {json.dumps(step)}\n')
+                self.f.write('            }\n')
             except Exception:
-                dataset_dict["MeasurementDetails"]["evenSampling"] = {
-                    "@index_curve": ref_name,
-                    "stepIncrement": 0.1
-                }
+                self.f.write('            "evenSampling": {\n')
+                self.f.write(f'              "@index_curve": {json.dumps(ref_name, ensure_ascii=False)},\n')
+                self.f.write('              "stepIncrement": 0.1\n')
+                self.f.write('            }\n')
+            self.f.write('          },\n')
 
+            # index curve
             try:
                 index_data = db.variableLoad(well_name, dataset_name, ref_name)
                 if index_data is not None:
@@ -332,56 +500,57 @@ class WellLogMLGenerator:
                         index_unit = db.variableUnit(well_name, dataset_name, ref_name)
                     except Exception:
                         index_unit = ''
-
                     try:
                         index_desc = db.variableDescription(well_name, dataset_name, ref_name)
                     except Exception:
                         index_desc = ''
-
                     try:
                         index_type = db.variableType(well_name, dataset_name, ref_name)
                     except Exception:
                         index_type = 'Continuous'
-
                     try:
                         index_family = db.variableFamily(well_name, dataset_name, ref_name)
                     except Exception:
                         index_family = ''
 
-                    try:
-                        index_values = [float(val) for val in np.asarray(index_data, dtype=float)]
-                    except (ValueError, TypeError):
-                        index_values = [str(val) if val is not None else '' for val in index_data]
+                    self.f.write('          "index": {\n')
+                    self.f.write(f'            "name": {json.dumps(ref_name, ensure_ascii=False)},\n')
+                    self.f.write(f'            "variableUnit": {json.dumps(index_unit, ensure_ascii=False)},\n')
+                    self.f.write(f'            "variableDescription": {json.dumps(index_desc, ensure_ascii=False)},\n')
+                    self.f.write(f'            "variableType": {json.dumps(index_type, ensure_ascii=False)},\n')
+                    self.f.write(f'            "variableFamily": {json.dumps(index_family, ensure_ascii=False)},\n')
+                    self.f.write('            "variableData": ')
 
-                    index_curve_info = {
-                        "name": ref_name,
-                        "variableUnit": index_unit,
-                        "variableDescription": index_desc,
-                        "variableType": index_type,
-                        "variableFamily": index_family,
-                        "variableData": index_values
-                    }
+                    try:
+                        index_values = np.asarray(index_data, dtype=float)
+                        self._write_numeric_array_compact(index_values)
+                    except (ValueError, TypeError):
+                        self._write_string_array_compact(index_data)
+
+                    self.f.write('\n')
+                    self.f.write('          },\n')
 
                     self._log(f"      Index curve ready: {ref_name} ({len(index_data):,} values)")
             except Exception as e:
                 self._log(f"      Could not load index curve {ref_name}: {e}", 'warning')
 
         except Exception:
-            dataset_dict["MeasurementDetails"] = {
-                "startIndex": 0,
-                "endIndex": 0,
-                "evenSampling": {
-                    "@index_curve": "MD",
-                    "stepIncrement": 0.1
-                }
-            }
+            self.f.write('          "MeasurementDetails": {\n')
+            self.f.write('            "startIndex": 0,\n')
+            self.f.write('            "endIndex": 0,\n')
+            self.f.write('            "evenSampling": {\n')
+            self.f.write('              "@index_curve": "MD",\n')
+            self.f.write('              "stepIncrement": 0.1\n')
+            self.f.write('            }\n')
+            self.f.write('          },\n')
 
-        dataset_dict["datasetProperties"] = {}
-
+        # datasetProperties
+        self.f.write('          "datasetProperties": ')
+        ds_props = {}
         try:
             prop_list = db.datasetPropertyList(well_name, dataset_name)
             if prop_list:
-                dataset_dict["datasetProperties"] = self._extract_properties(
+                ds_props = self._extract_properties(
                     prop_list,
                     lambda p: db.datasetPropertyValue(well_name, dataset_name, p),
                     lambda p: db.datasetPropertyUnit(well_name, dataset_name, p),
@@ -389,34 +558,46 @@ class WellLogMLGenerator:
                 )
         except Exception:
             pass
+        self._write_dict_inline(ds_props, '          ')
+        self.f.write(',\n')
 
-        dataset_dict["datasetHistory"] = []
+        # datasetHistory
+        self.f.write('          "datasetHistory": ')
+        ds_history = []
         try:
-            history = db.datasetHistory(well_name, dataset_name)
-            dataset_dict["datasetHistory"] = self._process_history(history)
+            ds_history = self._process_history(db.datasetHistory(well_name, dataset_name))
         except Exception:
             pass
+        self._write_list_inline(ds_history, '          ')
+        self.f.write(',\n')
 
-        if index_curve_info is not None:
-            dataset_dict["index"] = index_curve_info
-            self._log(f"      Index curve added: {index_curve_info['name']} ({len(index_curve_info['variableData']):,} values)")
+        # variables start
+        self.f.write('          "variables": {\n')
+        self._first_variable = True
 
-        dataset_dict["variables"] = {}
-
-        self.data["WellLogML"][self.current_well_name]["datasets"][dataset_name_value] = dataset_dict
-        self.current_dataset_name = dataset_name_value
         return True
+
+    def finalize_dataset(self):
+        """Close the current dataset's variables block and the dataset object."""
+        if self.f is None:
+            return
+        self.f.write('\n          }')   # close variables
+        self.f.write('\n        }')     # close dataset
 
     def add_curve(self, well_name: str, dataset_name: str, variable_name: str,
                   data: Optional[np.ndarray] = None, null_value: float = -9999) -> bool:
         """
-        Add a variable to the current dataset.
+        Add a variable to the current dataset, streaming directly to file.
 
         Returns:
-            False if the variable has no valid ID property.
+            True (always, for compatibility).
         """
-        if self.data is None or self.current_dataset_name is None:
+        if self.f is None or self.current_dataset_name is None:
             raise ValueError("Call add_dataset() before add_curve()")
+
+        if not self._first_variable:
+            self.f.write(',\n')
+        self._first_variable = False
 
         username = self._get_username()
 
@@ -424,22 +605,18 @@ class WellLogMLGenerator:
             var_type = db.variableType(well_name, dataset_name, variable_name)
         except Exception:
             var_type = 'Continuous'
-
         try:
             family = db.variableFamily(well_name, dataset_name, variable_name)
         except Exception:
             family = ''
-
         try:
             unit = db.variableUnit(well_name, dataset_name, variable_name)
         except Exception:
             unit = ''
-
         try:
             description = db.variableDescription(well_name, dataset_name, variable_name)
         except Exception:
             description = ''
-
         try:
             group = db.variableGroup(well_name, dataset_name, variable_name)
             if isinstance(group, (list, tuple)):
@@ -448,7 +625,6 @@ class WellLogMLGenerator:
                 group_str = str(group) if group else ''
         except Exception:
             group_str = ''
-
         try:
             var_name = db.variableName(well_name, dataset_name, variable_name)
         except Exception:
@@ -460,30 +636,33 @@ class WellLogMLGenerator:
             if data_type in ('string', 'mixed'):
                 unit = 'unitless'
 
-        variable_dict = {
-            "nullValue": null_value,
-            "variableType": var_type,
-            "variableUnit": unit,
-            "variableDescription": description,
-            "variableGroup": group_str,
-            "variableFamily": family
-        }
+        self.f.write(f'            {json.dumps(var_name, ensure_ascii=False)}: {{\n')
+        self.f.write(f'              "nullValue": {json.dumps(null_value)},\n')
+        self.f.write(f'              "variableType": {json.dumps(var_type, ensure_ascii=False)},\n')
+        self.f.write(f'              "variableUnit": {json.dumps(unit, ensure_ascii=False)},\n')
+        self.f.write(f'              "variableDescription": {json.dumps(description, ensure_ascii=False)},\n')
+        self.f.write(f'              "variableGroup": {json.dumps(group_str, ensure_ascii=False)},\n')
+        self.f.write(f'              "variableFamily": {json.dumps(family, ensure_ascii=False)},\n')
 
+        # variableHistory
+        self.f.write('              "variableHistory": ')
         try:
             var_history = db.variableHistory(well_name, dataset_name, variable_name)
             history = self._process_history(var_history)
             if not history:
                 history = [{"dateTime": str(self._get_timestamp()), "userName": username, "action": "Created"}]
-            variable_dict["variableHistory"] = history
         except Exception:
-            variable_dict["variableHistory"] = [{"dateTime": str(self._get_timestamp()), "userName": username, "action": "Created"}]
+            history = [{"dateTime": str(self._get_timestamp()), "userName": username, "action": "Created"}]
+        self._write_list_inline(history, '              ')
+        self.f.write(',\n')
 
-        variable_dict["variableProperties"] = {}
-
+        # variableProperties
+        self.f.write('              "variableProperties": ')
+        var_props = {}
         try:
             prop_list = db.variablePropertyList(well_name, dataset_name, variable_name)
             if prop_list:
-                variable_dict["variableProperties"] = self._extract_properties(
+                var_props = self._extract_properties(
                     prop_list,
                     lambda p: db.variablePropertyValue(well_name, dataset_name, variable_name, p),
                     lambda p: db.variablePropertyUnit(well_name, dataset_name, variable_name, p),
@@ -491,71 +670,64 @@ class WellLogMLGenerator:
                 )
         except Exception:
             pass
+        self._write_dict_inline(var_props, '              ')
+        self.f.write(',\n')
 
+        # variableData
+        self.f.write('              "variableData": ')
         if data is not None and len(data) > 0:
             if data_type in ('numeric', 'mixed'):
                 try:
                     data_array = np.asarray(data, dtype=float)
-                    data_clean = np.where(
-                        (np.isnan(data_array)) | (data_array == null_value),
-                        null_value,
-                        data_array
-                    )
-                    variable_dict["variableData"] = [float(val) for val in data_clean]
+                    self._write_numeric_array_compact(data_array, null_value=null_value)
                 except (ValueError, TypeError):
-                    variable_dict["variableData"] = [str(val) if val is not None else '' for val in data]
+                    self._write_string_array_compact(data)
             else:
-                variable_dict["variableData"] = [str(val) if val is not None else '' for val in data]
+                self._write_string_array_compact(data)
         else:
-            variable_dict["variableData"] = []
+            self.f.write('[]')
 
-        self.data["WellLogML"][self.current_well_name]["datasets"][self.current_dataset_name]["variables"][var_name] = variable_dict
+        self.f.write('\n')
+        self.f.write('            }')
+
         return True
 
-    def save(self, filename: str) -> bool:
-        """Save the document to a JSON file."""
-        if self.data is None:
+    def save(self) -> bool:
+        """Finalize and close the streaming JSON file."""
+        if self.f is None:
             raise ValueError("Call create_document() before save()")
 
-        json_str = json.dumps(self.data, ensure_ascii=False, indent=2)
-
-        def compact_data_array(match):
-            indent = match.group(1)
-            key_name = match.group(2)
-            array_content = match.group(3)
-
-            # Leave string arrays as-is; compact only numeric arrays
-            if '"' in array_content:
-                return match.group(0)
-
-            values = re.findall(r'-?\d+\.?\d*(?:[eE][+-]?\d+)?', array_content)
-            if not values:
-                return match.group(0)
-
-            compact = ', '.join(values)
-            return f'{indent}"{key_name}": [{compact}]'
-
-        pattern = r'(\s*)"(variableData)":\s*\[((?:[^\[\]]|\n)*?)\]'
-        json_str = re.sub(pattern, compact_data_array, json_str)
-
-        target_dir = os.path.dirname(os.path.abspath(filename))
-        fd, tmp_path = tempfile.mkstemp(dir=target_dir, suffix='.tmp')
         try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(json_str)
-            os.replace(tmp_path, filename)
+            self.f.write('\n      }\n')   # close datasets
+            self.f.write('    }\n')       # close well
+            self.f.write('  }\n')         # close WellLogML
+            self.f.write('}\n')           # close root
+            self.f.close()
+            os.replace(self._tmp_path, self.filename)
         except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            self._cleanup()
             raise
 
-        file_size = os.path.getsize(filename)
-        msg = f"File saved: {filename} (size: {file_size:,} bytes)"
+        self.f = None
+        file_size = os.path.getsize(self.filename)
+        msg = f"File saved: {self.filename} (size: {file_size:,} bytes)"
         self._log(msg)
         print(f"  ✓ {msg}")
         return True
+
+    def _cleanup(self):
+        """Close file handle and remove temp file on error."""
+        if self.f:
+            try:
+                self.f.close()
+            except Exception:
+                pass
+            self.f = None
+        if self._tmp_path and os.path.exists(self._tmp_path):
+            try:
+                os.unlink(self._tmp_path)
+            except OSError:
+                pass
 
 
 def welllogml_write_from_techlog(output_dir: str = None):
@@ -630,9 +802,17 @@ def welllogml_write_from_techlog(output_dir: str = None):
                 logger.info(f"[{idx}/{len(wells)}] Started: {well_name}")
                 logger.info(f"  Start time: {well_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 logger.info(f"{'='*60}")
+
+                well_name_clean = str(well_name).strip()
+                for ch in r'\/*?"<>|':
+                    well_name_clean = well_name_clean.replace(ch, '_')
+
+                timestamp_str = datetime.now().strftime('%y%m%d_%H%M%S')
+                output_filename = os.path.join(folderName, f"{well_name_clean}_{timestamp_str}.json")
+
                 generator = WellLogMLGenerator(techlog_version="2023.1", logger=logger)
 
-                if not generator.create_document(well_name):
+                if not generator.create_document(well_name, output_filename):
                     stats['errors'] += 1
                     stats['wells_skipped_no_id'] += 1
                     logger.error(f"Well '{well_name}' skipped: no valid ID property")
@@ -692,6 +872,7 @@ def welllogml_write_from_techlog(output_dir: str = None):
                                 data_points = len(curve_data)
                                 well_total_data_points += data_points
                                 well_total_vars += 1
+                                del curve_data
 
                                 try:
                                     var_unit = db.variableUnit(well_name, dataset_name, variable_name)
@@ -717,17 +898,12 @@ def welllogml_write_from_techlog(output_dir: str = None):
                             print(f"    ✗ {error_msg}")
                             logger.error(f"        {error_msg}")
 
+                    generator.finalize_dataset()
+
                 logger.info(f"  Stats for well {well_name}:")
                 logger.info(f"    - Datasets: {len(datasets)}")
                 logger.info(f"    - Variables: {well_total_vars}")
                 logger.info(f"    - Data points: {well_total_data_points:,}")
-
-                well_name_clean = str(well_name).strip()
-                for ch in r'\/:*?"<>|':
-                    well_name_clean = well_name_clean.replace(ch, '_')
-
-                timestamp_str = datetime.now().strftime('%y%m%d_%H%M%S')
-                output_filename = os.path.join(folderName, f"{well_name_clean}_{timestamp_str}.json")
 
                 file_exists = os.path.exists(output_filename)
 
@@ -736,7 +912,7 @@ def welllogml_write_from_techlog(output_dir: str = None):
                 logger.info(f"    File: {output_filename}")
                 logger.info(f"    Exists: {'Yes' if file_exists else 'No'}")
 
-                generator.save(output_filename)
+                generator.save()
 
                 if file_exists:
                     stats['updated'] += 1
@@ -769,6 +945,12 @@ def welllogml_write_from_techlog(output_dir: str = None):
                 import traceback
                 traceback.print_exc()
                 logger.error(traceback.format_exc())
+
+                try:
+                    if 'generator' in locals():
+                        generator._cleanup()
+                except Exception:
+                    pass
     finally:
         export_end_time = datetime.now()
         export_duration = (export_end_time - export_start_time).total_seconds()
