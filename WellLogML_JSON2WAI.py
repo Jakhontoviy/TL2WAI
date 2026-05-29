@@ -58,9 +58,17 @@ if sys.stdout.encoding.lower() != 'utf-8':
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from client.server.remote_server import RemoteServer
+from client.shared.filters.well_filter import WellProperty
 import numpy as np
 import json
 import glob
+
+# Try importing tqdm for progress bars
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 # Try importing ijson for true streaming of large JSON files
 _IJSON_AVAILABLE = False
@@ -75,27 +83,25 @@ except ImportError:
 # CONFIGURATION
 # ========================
 
-# WAI DB project name to import into
-PROJECT_NAME = 'Techlog_project'
+PROJECT_NAME = 'AutoImport_fromTechlog'    # WAI DB project name to import into
+SOURCE_DIR = r'C:\Temp\TL'   # Folder containing JSON files to import
 
-# Folder containing JSON files to import
-SOURCE_DIR = r'C:\Temp\TL'
-
-# Datasets to skip (e.g. 'Survey', 'MICP')
-# Use to exclude datasets that contain no useful log data
-SKIP_DATASETS = ['Survey']
-
-# Value treated as null/missing in Techlog data
-NULL_VALUE = -9999.0
-
-# Convert depths to metres on import
-# Depth unit is read from each dataset's index.variableUnit field
-CONVERT_DEPTH_TO_METERS = False
+SKIP_DATASETS = []  # Datasets to skip (e.g. 'Survey', 'MICP')
+NULL_VALUE = -9999.0   # Value treated as null/missing in Techlog data
+CONVERT_DEPTH_TO_METERS = False    # Convert depths to metres on import
 
 # Use the family from the JSON file or determine it automatically
 # True  = load variableFamily from the JSON file as-is
 # False = ignore variableFamily from JSON and auto-detect via prj.family_assigner
 USE_FAMILY = False
+
+# Use the Field property from JSON to set the field (place) in WAI DB
+# True  = when creating a well, use the Field/field property from JSON as the field
+# False = use the default field
+USE_FIELD_AS_FIELD = True
+
+# Verbose mode: lots of prints vs minimal output with progress bars
+VERBOSE = False
 
 # Retry connection on failure
 RETRY_CONNECTION = True
@@ -220,6 +226,12 @@ def convert_depth_to_meters(depth_array, from_unit):
         return depth_array, from_unit, 1.0
 
 
+def _vprint(*args, **kwargs):
+    """Print only when VERBOSE mode is enabled."""
+    if VERBOSE:
+        print(*args, **kwargs)
+
+
 def extract_well_name(welllogml_dict):
     """
     Extract the well name from a WellLogML dictionary.
@@ -311,6 +323,30 @@ def _load_well_properties(well_name, filepath):
     return props
 
 
+def _load_field_name(well_name, filepath):
+    """Load field name from WellLogML JSON using ijson."""
+    try:
+        with open(filepath, 'rb') as f:
+            for key, value in ijson.kvitems(f, f'WellLogML.{well_name}'):
+                if key in ('Field', 'field'):
+                    if isinstance(value, dict):
+                        return value.get('value')
+                    return value
+    except Exception:
+        pass
+    # Try wellProperties if not found at well level
+    try:
+        with open(filepath, 'rb') as f:
+            for key, value in ijson.kvitems(f, f'WellLogML.{well_name}.wellProperties'):
+                if key in ('Field', 'field'):
+                    if isinstance(value, dict):
+                        return value.get('value')
+                    return value
+    except Exception:
+        pass
+    return None
+
+
 def _load_dataset_index(well_name, dataset_name, filepath):
     """Load index curve metadata + data for a single dataset using ijson."""
     prefix = f'WellLogML.{well_name}.datasets.{dataset_name}.index'
@@ -354,13 +390,13 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
         # Detect accidental char-array from a single string value
         if var_values.dtype.kind == 'U' and len(var_values) > 1:
             if all(len(str(v)) == 1 for v in var_values):
-                print(f'        ⚠ {var_name} ({var_type}): possible string-to-char-array conversion (skipped)')
+                _vprint(f'        ⚠ {var_name} ({var_type}): possible string-to-char-array conversion (skipped)')
                 stats['curves_skipped'] += 1
                 del var_values
                 return
 
         if len(var_values) == 0:
-            print(f'        ⊘ {var_name} ({var_type}): no data (skipped)')
+            _vprint(f'        ⊘ {var_name} ({var_type}): no data (skipped)')
             stats['curves_skipped'] += 1
             del var_values
             return
@@ -370,23 +406,23 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
             if len(var_values) > 0 and len(var_values) % len(index_data) == 0:
                 num_columns = len(var_values) // len(index_data)
                 if num_columns > 1:
-                    print(f'        ℹ {var_name}: multi-column data — reshaping {len(var_values)} → ({len(index_data)}×{num_columns})')
+                    _vprint(f'        ℹ {var_name}: multi-column data — reshaping {len(var_values)} → ({len(index_data)}×{num_columns})')
                     try:
                         reshaped = var_values.reshape((num_columns, len(index_data))).T
-                        print(f'          After reshape: shape {reshaped.shape}, dtype {reshaped.dtype}')
+                        _vprint(f'          After reshape: shape {reshaped.shape}, dtype {reshaped.dtype}')
                         var_values = reshaped
                     except Exception as e:
-                        print(f'        ✗ {var_name}: reshape error: {e}')
+                        _vprint(f'        ✗ {var_name}: reshape error: {e}')
                         stats['curves_skipped'] += 1
                         del var_values
                         return
                 else:
-                    print(f'        - {var_name}: data length {len(var_values)} does not match index {len(index_data)} (skipped)')
+                    _vprint(f'        - {var_name}: data length {len(var_values)} does not match index {len(index_data)} (skipped)')
                     stats['curves_skipped'] += 1
                     del var_values
                     return
             else:
-                print(f'        - {var_name}: data length {len(var_values)} does not match index {len(index_data)}, not a multiple (skipped)')
+                _vprint(f'        - {var_name}: data length {len(var_values)} does not match index {len(index_data)}, not a multiple (skipped)')
                 stats['curves_skipped'] += 1
                 del var_values
                 return
@@ -394,7 +430,7 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
         var_values = replace_null_values(var_values, null_value)
 
         if var_values.ndim == 2:
-            print(f'          After replace_null_values: shape {var_values.shape}, NaN count {np.sum(np.isnan(var_values))}')
+            _vprint(f'          After replace_null_values: shape {var_values.shape}, NaN count {np.sum(np.isnan(var_values))}')
 
         original_family = var_family
 
@@ -403,11 +439,11 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
                 mnemonic_info = prj.family_assigner.assign_family(var_name, var_unit)
                 var_family = mnemonic_info.family
                 if not USE_FAMILY:
-                    print(f'        ℹ {var_name}: family auto-detected = {var_family}')
+                    _vprint(f'        ℹ {var_name}: family auto-detected = {var_family}')
             except Exception:
                 var_family = original_family
                 if not USE_FAMILY and not var_family:
-                    print(f'        ⚠ {var_name}: could not determine family, left empty')
+                    _vprint(f'        ⚠ {var_name}: could not determine family, left empty')
 
         log = well.logs.create(
             name=var_name,
@@ -420,13 +456,13 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
         if var_properties:
             props_count = apply_properties(log, var_properties)
             if props_count > 0:
-                print(f'        ℹ Log properties loaded: {props_count}')
+                _vprint(f'        ℹ Log properties loaded: {props_count}')
 
         if var_values.ndim == 2:
             num_nan = np.sum(np.isnan(var_values))
-            print(f'          Before set_rvalues: index {index_data.shape}, values {var_values.shape}, NaN={num_nan}')
+            _vprint(f'          Before set_rvalues: index {index_data.shape}, values {var_values.shape}, NaN={num_nan}')
             if var_values.shape[0] != len(index_data):
-                print(f'          ✗ ERROR: shape mismatch! index={len(index_data)}, values[0]={var_values.shape[0]}')
+                _vprint(f'          ✗ ERROR: shape mismatch! index={len(index_data)}, values[0]={var_values.shape[0]}')
                 stats['curves_skipped'] += 1
                 del var_values
                 return
@@ -435,16 +471,16 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
         log.save()
 
         if var_values.ndim == 2:
-            print(f'        ✓ {var_name} ({var_family}, {var_unit}) {var_values.shape[0]} points × {var_values.shape[1]} columns')
+            _vprint(f'        ✓ {var_name} ({var_family}, {var_unit}) {var_values.shape[0]} points × {var_values.shape[1]} columns')
         else:
-            print(f'        ✓ {var_name} ({var_family}, {var_unit}, {len(var_values)} points)')
+            _vprint(f'        ✓ {var_name} ({var_family}, {var_unit}, {len(var_values)} points)')
         stats['curves_ok'] += 1
 
         del var_values
 
     except Exception as e:
         err_msg = f'{var_name}: {e}'
-        print(f'        ✗ {err_msg}')
+        _vprint(f'        ✗ {err_msg}')
         stats['error_list'].append(err_msg)
         stats['errors'] += 1
 
@@ -460,7 +496,28 @@ def _import_well_streaming(prj, filepath, stats):
     print(f'\n  Processing well: {well_name}')
 
     try:
-        well = prj.wells.get_by_name(well_name, create_if_absent=True)
+        field_obj = None
+        if USE_FIELD_AS_FIELD:
+            field_name = _load_field_name(well_name, filepath)
+            if field_name:
+                field_obj = prj.fields.get_by_name(field_name, create_if_absent=True)
+                if field_obj:
+                    field_obj.save()
+                _vprint(f'    ℹ Field: {field_name}')
+
+        # Search well by name and field to avoid ambiguity
+        filter_kwargs = {'names': [well_name], 'properties': [WellProperty.id, WellProperty.name]}
+        if field_obj:
+            filter_kwargs['fields'] = [field_obj]
+        wells = prj.wells.filter(**filter_kwargs)
+        if len(wells) == 1:
+            well = wells[0]
+            if USE_FIELD_AS_FIELD and field_obj and well.field != field_obj:
+                well.field = field_obj
+        elif len(wells) == 0:
+            well = prj.wells.create(name=well_name, field=field_obj)
+        else:
+            raise NameError(f'Multiple wells with name "{well_name}" in field {field_obj}')
         well.save()
     except Exception as e:
         stats['error_list'].append(f'Error creating well: {e}')
@@ -472,8 +529,8 @@ def _import_well_streaming(prj, filepath, stats):
         props_count = apply_properties(well, well_properties)
         if props_count > 0:
             well.save()
-            print(f'    ℹ Well properties loaded: {props_count}')
-    print(f'    ✓ Well retrieved/created')
+            _vprint(f'    ℹ Well properties loaded: {props_count}')
+    _vprint(f'    ✓ Well retrieved/created')
 
     # Collect dataset names without materialising their contents
     dataset_names = []
@@ -483,17 +540,18 @@ def _import_well_streaming(prj, filepath, stats):
             if p == prefix and event == 'map_key':
                 dataset_names.append(value)
 
-    for dataset_name in dataset_names:
+    dataset_iter = dataset_names if VERBOSE else tqdm(dataset_names, desc='Datasets', unit='ds', leave=False)
+    for dataset_name in dataset_iter:
         if dataset_name in SKIP_DATASETS:
-            print(f'    ⊘ Dataset skipped: {dataset_name}')
+            _vprint(f'    ⊘ Dataset skipped: {dataset_name}')
             stats['curves_skipped'] += 1
             continue
 
-        print(f'    Dataset: {dataset_name}')
+        _vprint(f'    Dataset: {dataset_name}')
 
         index = _load_dataset_index(well_name, dataset_name, filepath)
         if not index:
-            print(f'      ✗ No index curve (depth)')
+            _vprint(f'      ✗ No index curve (depth)')
             stats['error_list'].append(f'{dataset_name}: no index curve')
             stats['errors'] += 1
             continue
@@ -505,7 +563,7 @@ def _import_well_streaming(prj, filepath, stats):
         del index_data_raw, index
 
         if len(index_data) == 0:
-            print(f'      ✗ Index curve is empty')
+            _vprint(f'      ✗ Index curve is empty')
             stats['error_list'].append(f'{dataset_name}: index curve is empty')
             stats['errors'] += 1
             del index_data
@@ -514,9 +572,9 @@ def _import_well_streaming(prj, filepath, stats):
         reference_unit = index_unit
         if CONVERT_DEPTH_TO_METERS and index_unit.lower() != 'm':
             index_data, reference_unit, factor = convert_depth_to_meters(index_data, index_unit)
-            print(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit} → {reference_unit}, factor: {factor})')
+            _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit} → {reference_unit}, factor: {factor})')
         else:
-            print(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit})')
+            _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit})')
 
         for var_name, var_info in _stream_dataset_variables(well_name, dataset_name, filepath):
             _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats)
@@ -550,7 +608,33 @@ def _import_well_fallback(prj, filepath, stats):
     print(f'\n  Processing well: {well_name}')
 
     try:
-        well = prj.wells.get_by_name(well_name, create_if_absent=True)
+        field_obj = None
+        if USE_FIELD_AS_FIELD:
+            field_data = well_data.get('Field') or well_data.get('field')
+            if not field_data:
+                well_properties = well_data.get('wellProperties', {})
+                field_data = well_properties.get('Field') or well_properties.get('field')
+            field_name = field_data.get('value') if isinstance(field_data, dict) else field_data
+            _vprint(f'    DEBUG raw field_data: {field_data}, resolved field_name: {field_name}')
+            if field_name:
+                field_obj = prj.fields.get_by_name(field_name, create_if_absent=True)
+                if field_obj:
+                    field_obj.save()
+                _vprint(f'    ℹ Field: {field_name}')
+
+        # Search well by name and field to avoid ambiguity
+        filter_kwargs = {'names': [well_name], 'properties': [WellProperty.id, WellProperty.name]}
+        if field_obj:
+            filter_kwargs['fields'] = [field_obj]
+        wells = prj.wells.filter(**filter_kwargs)
+        if len(wells) == 1:
+            well = wells[0]
+            if USE_FIELD_AS_FIELD and field_obj and well.field != field_obj:
+                well.field = field_obj
+        elif len(wells) == 0:
+            well = prj.wells.create(name=well_name, field=field_obj)
+        else:
+            raise NameError(f'Multiple wells with name "{well_name}" in field {field_obj}')
         well.save()
 
         well_properties = well_data.get('wellProperties', {})
@@ -558,9 +642,9 @@ def _import_well_fallback(prj, filepath, stats):
             props_count = apply_properties(well, well_properties)
             if props_count > 0:
                 well.save()
-                print(f'    ℹ Well properties loaded: {props_count}')
+                _vprint(f'    ℹ Well properties loaded: {props_count}')
 
-        print(f'    ✓ Well retrieved/created')
+        _vprint(f'    ✓ Well retrieved/created')
     except Exception as e:
         stats['error_list'].append(f'Error creating well: {e}')
         stats['errors'] += 1
@@ -568,20 +652,20 @@ def _import_well_fallback(prj, filepath, stats):
 
     # Pop datasets so they can be freed as we go
     datasets = well_data.pop('datasets', {})
-    for dataset_name in list(datasets.keys()):
-        dataset = datasets.pop(dataset_name)
-
+    dataset_items = list(datasets.items())
+    dataset_iter = dataset_items if VERBOSE else tqdm(dataset_items, desc='Datasets', unit='ds', leave=False)
+    for dataset_name, dataset in dataset_iter:
         if dataset_name in SKIP_DATASETS:
-            print(f'    ⊘ Dataset skipped: {dataset_name}')
+            _vprint(f'    ⊘ Dataset skipped: {dataset_name}')
             stats['curves_skipped'] += 1
             del dataset
             continue
 
-        print(f'    Dataset: {dataset_name}')
+        _vprint(f'    Dataset: {dataset_name}')
 
         index = dataset.get('index')
         if not index:
-            print(f'      ✗ No index curve (depth)')
+            _vprint(f'      ✗ No index curve (depth)')
             stats['error_list'].append(f'{dataset_name}: no index curve')
             stats['errors'] += 1
             del dataset
@@ -592,7 +676,7 @@ def _import_well_fallback(prj, filepath, stats):
         index_data = np.array(index.get('variableData', []))
 
         if len(index_data) == 0:
-            print(f'      ✗ Index curve is empty')
+            _vprint(f'      ✗ Index curve is empty')
             stats['error_list'].append(f'{dataset_name}: index curve is empty')
             stats['errors'] += 1
             del dataset
@@ -601,9 +685,9 @@ def _import_well_fallback(prj, filepath, stats):
         reference_unit = index_unit
         if CONVERT_DEPTH_TO_METERS and index_unit.lower() != 'm':
             index_data, reference_unit, factor = convert_depth_to_meters(index_data, index_unit)
-            print(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit} → {reference_unit}, factor: {factor})')
+            _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit} → {reference_unit}, factor: {factor})')
         else:
-            print(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit})')
+            _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit})')
 
         # Pop variables so they can be freed as we go
         variables = dataset.pop('variables', {})
@@ -693,8 +777,10 @@ def main():
     print('=' * 70)
 
     all_stats = []
-    for i, filepath in enumerate(json_files, 1):
-        print(f'\n[{i}/{len(json_files)}] {os.path.basename(filepath)}')
+    file_iterator = enumerate(json_files, 1) if VERBOSE else enumerate(tqdm(json_files, desc='Importing files', unit='file'), 1)
+    for i, filepath in file_iterator:
+        if VERBOSE:
+            print(f'\n[{i}/{len(json_files)}] {os.path.basename(filepath)}')
         stats = import_well_from_json(prj, filepath)
         all_stats.append(stats)
 
