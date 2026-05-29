@@ -358,6 +358,17 @@ def _load_dataset_index(well_name, dataset_name, filepath):
         return None
 
 
+def _load_dataset_group(well_name, dataset_name, filepath):
+    """Load datasetGroup for a single dataset using ijson."""
+    prefix = f'WellLogML.{well_name}.datasets.{dataset_name}.datasetGroup'
+    try:
+        with open(filepath, 'rb') as f:
+            it = ijson.items(f, prefix)
+            return next(it)
+    except StopIteration:
+        return None
+
+
 def _stream_dataset_variables(well_name, dataset_name, filepath):
     """Yield (var_name, var_info) pairs one at a time using ijson."""
     prefix = f'WellLogML.{well_name}.datasets.{dataset_name}.variables'
@@ -370,7 +381,7 @@ def _stream_dataset_variables(well_name, dataset_name, filepath):
 # Import functions
 # ---------------------------------------------------------------------------
 
-def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats):
+def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats, dataset_group=None):
     """Process a single variable and save it to WAI DB."""
     try:
         var_data_raw = var_info.get('variableData', [])
@@ -445,9 +456,10 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
                 if not USE_FAMILY and not var_family:
                     _vprint(f'        ⚠ {var_name}: could not determine family, left empty')
 
+        log_group = [dataset_group, dataset_name] if dataset_group else [dataset_name]
         log = well.logs.create(
             name=var_name,
-            group=[dataset_name],
+            group=log_group,
             values_family=var_family,
             values_unit=var_unit,
             reference_unit=index_unit
@@ -547,7 +559,8 @@ def _import_well_streaming(prj, filepath, stats):
             stats['curves_skipped'] += 1
             continue
 
-        _vprint(f'    Dataset: {dataset_name}')
+        dataset_group = _load_dataset_group(well_name, dataset_name, filepath)
+        _vprint(f'    Dataset: {dataset_name}' + (f' (group: {dataset_group})' if dataset_group else ''))
 
         index = _load_dataset_index(well_name, dataset_name, filepath)
         if not index:
@@ -577,7 +590,7 @@ def _import_well_streaming(prj, filepath, stats):
             _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit})')
 
         for var_name, var_info in _stream_dataset_variables(well_name, dataset_name, filepath):
-            _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats)
+            _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats, dataset_group)
             del var_info
 
         stats['datasets_ok'] += 1
@@ -661,7 +674,8 @@ def _import_well_fallback(prj, filepath, stats):
             del dataset
             continue
 
-        _vprint(f'    Dataset: {dataset_name}')
+        dataset_group = dataset.get('datasetGroup')
+        _vprint(f'    Dataset: {dataset_name}' + (f' (group: {dataset_group})' if dataset_group else ''))
 
         index = dataset.get('index')
         if not index:
@@ -693,7 +707,7 @@ def _import_well_fallback(prj, filepath, stats):
         variables = dataset.pop('variables', {})
         for var_name in list(variables.keys()):
             var_info = variables.pop(var_name)
-            _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats)
+            _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats, dataset_group)
             del var_info
 
         stats['datasets_ok'] += 1

@@ -27,6 +27,11 @@
 ### WellLogML_JSON2WAI.py
 
 #### Added
+- **Dataset group support**: reads the `datasetGroup` field from each dataset and uses it as the first element of the log group (e.g. `group = [datasetGroup, datasetName]`). Falls back to `group = [datasetName]` when `datasetGroup` is absent.
+  - `_load_dataset_group()` – streaming helper that fetches `datasetGroup` for a single dataset via `ijson`.
+  - `_process_variable()` now accepts an optional `dataset_group` argument and builds the log group accordingly.
+  - Both streaming (`_import_well_streaming`) and fallback (`_import_well_fallback`) paths updated to extract and pass `datasetGroup`.
+  - Verbose output now prints the dataset group when present.
 - **Streaming import mode via `ijson`** (optional). If the `ijson` package is installed, the importer reads datasets and variables one at a time, keeping the memory footprint low even for multi-gigabyte JSON files.
   - `_get_well_name()` – extracts the well name without loading the whole file.
   - `_load_well_properties()` / `_load_field_name()` – stream well-level metadata.
