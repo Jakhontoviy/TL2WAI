@@ -54,8 +54,9 @@ if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# Add project root to path for module imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+# Add project root to path for module imports (only when running as a file, not in Jupyter)
+if '__file__' in globals():
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from client.server.remote_server import RemoteServer
 from client.shared.filters.well_filter import WellProperty
@@ -749,8 +750,16 @@ def import_well_from_json(prj, filepath):
     return _import_well_fallback(prj, filepath, stats)
 
 
-def main():
-    """Main import function."""
+def main(source_dir=None, project_name=None):
+    """Main import function.
+
+    Args:
+        source_dir: folder with JSON files (default: SOURCE_DIR constant)
+        project_name: WAI DB project name (default: PROJECT_NAME constant)
+    """
+    src = source_dir if source_dir is not None else SOURCE_DIR
+    prj_name = project_name if project_name is not None else PROJECT_NAME
+
     print('=' * 70)
     print('WellLogML JSON → WAI DB Importer')
     if _IJSON_AVAILABLE:
@@ -767,19 +776,19 @@ def main():
         print(f'✗ Connection error: {e}')
         return
 
-    print(f'\nOpening project: {PROJECT_NAME}')
+    print(f'\nOpening project: {prj_name}')
     try:
-        prj = gc.projects.get_by_name(PROJECT_NAME)
+        prj = gc.projects.get_by_name(prj_name)
         if not prj:
-            print(f'✗ Project {PROJECT_NAME} not found')
+            print(f'✗ Project {prj_name} not found')
             return
         print(f'✓ Project found')
     except Exception as e:
         print(f'✗ Error opening project: {e}')
         return
 
-    print(f'\nScanning directory: {SOURCE_DIR}')
-    json_files = sorted(glob.glob(os.path.join(SOURCE_DIR, '*.json')))
+    print(f'\nScanning directory: {src}')
+    json_files = sorted(glob.glob(os.path.join(src, '*.json')))
     print(f'JSON files found: {len(json_files)}')
 
     if not json_files:
