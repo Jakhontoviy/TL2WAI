@@ -34,13 +34,7 @@ Techlog  →  WellLogML JSON  →  WAI DB
 
 ### 1. Export from Techlog
 
-Run `WellLogML_Techlog2JSON.py` inside the **Techlog Python console**:
-
-```python
-from WellLogML_Techlog2JSON import welllogml_write_from_techlog
-
-welllogml_write_from_techlog(output_dir=r'C:\Temp\TL')
-```
+Run `WellLogML_Techlog2JSON.py` inside the **Techlog Python3 Interface Window**:
 
 Each well is saved as `<WellName>_<timestamp>.json` in the output directory. A timestamped log file is written to `<output_dir>/log/`.
 
