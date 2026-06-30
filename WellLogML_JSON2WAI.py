@@ -322,6 +322,17 @@ def _load_dataset_index(well_name, dataset_name, filepath):
         return None
 
 
+def _load_dataset_photos(well_name, dataset_name, filepath):
+    """Load photos block for a single dataset using ijson."""
+    prefix = f'WellLogML.{well_name}.datasets.{dataset_name}.photos'
+    try:
+        with open(filepath, 'rb') as f:
+            it = ijson.items(f, prefix)
+            return next(it)
+    except StopIteration:
+        return None
+
+
 def _stream_dataset_variables(well_name, dataset_name, filepath):
     """Yield (var_name, var_info) pairs one at a time using ijson."""
     prefix = f'WellLogML.{well_name}.datasets.{dataset_name}.variables'
@@ -333,6 +344,147 @@ def _stream_dataset_variables(well_name, dataset_name, filepath):
 # ---------------------------------------------------------------------------
 # Import functions
 # ---------------------------------------------------------------------------
+
+def _process_photos(prj, well, dataset_name, photos_dict, source_dir, stats, reference_unit=None):
+    """
+    Import photos into WAI DB as image blobs grouped by depth intervals.
+
+    Uses the GroupWithReference + Blob approach from import_corephoto.py:
+    each photo becomes a Blob (type=IMAGE) linked to the default borehole
+    and is added to a group at path [<var_name>] with a RangeReference(top, base).
+
+    Parameters:
+    - prj: WAI DB Project (needed for blobs and groups_with_reference)
+    - well: WAI DB Well object
+    - dataset_name: source dataset name (used in stats/error messages)
+    - photos_dict: dict {var_name: {count, folder, items: [{top, base, filename, path}]}}
+    - source_dir: root folder used to resolve relative photo paths
+    - stats: import statistics dict (mutated in place)
+    - reference_unit: optional unit string for the depth reference (defaults to MD unit)
+    """
+    if not photos_dict:
+        return
+
+    try:
+        from client.shared.settings import MD_REFERENCE_UNIT
+        from client.shared.data_reference import ReferenceFamily
+        from client.shared.blob_utilities.blob_types import BlobTypeID, BlobLink
+        from client.shared.db.object_type import ObjectType
+        from client.objects.group_with_reference.group_with_reference_element import Element
+        from client.objects.group_with_reference.group_with_reference_reference_data import ReferenceData
+        from client.objects.group_with_reference.group_with_reference_reference import RangeReference
+    except ImportError as e:
+        print(f'    ✗ Required modules for photo import not available: {e}')
+        for var_name, photo_info in photos_dict.items():
+            stats['photos_skipped'] += len(photo_info.get('items', []))
+        return
+
+    REFERENCE_FAMILY = ReferenceFamily.MEASURED_DEPTH
+    REFERENCE_UNIT = reference_unit or MD_REFERENCE_UNIT
+
+    borehole = well.boreholes.get_by_name('default')
+    if borehole is None:
+        print(f'    ✗ Borehole "default" not found for well {well.name}')
+        for var_name, photo_info in photos_dict.items():
+            stats['photos_skipped'] += len(photo_info.get('items', []))
+        return
+
+    for var_name, photo_info in photos_dict.items():
+        items = photo_info.get('items', [])
+        if not items:
+            continue
+
+        print(f'    Photos ({var_name}): {len(items)} items')
+
+        group_path = [var_name]
+        elements = []
+        skipped = 0
+
+        for item in items:
+            photo_path = item.get('path', '')
+            if not os.path.isabs(photo_path):
+                photo_path = os.path.join(source_dir, photo_path)
+
+            if not os.path.exists(photo_path):
+                print(f'      ⚠ Photo not found: {photo_path}')
+                skipped += 1
+                continue
+
+            top = item.get('top')
+            bottom = item.get('base')
+
+            try:
+                top_val = float(top) if top is not None else None
+                bottom_val = float(bottom) if bottom is not None else None
+            except (ValueError, TypeError):
+                top_val = None
+                bottom_val = None
+
+            if top_val is None or bottom_val is None or top_val >= bottom_val:
+                print(f'      ⚠ Invalid depths for {os.path.basename(photo_path)} (top={top}, base={bottom})')
+                skipped += 1
+                continue
+
+            try:
+                with open(photo_path, 'rb') as f:
+                    image_data = f.read()
+
+                blob = prj.blobs.create(
+                    type=BlobTypeID.IMAGE,
+                    data=image_data,
+                    name=os.path.basename(photo_path),
+                )
+                blob.save()
+                blob.add_links([BlobLink(id=borehole.id, type=ObjectType.BOREHOLE)])
+
+                element = Element(
+                    obj=blob,
+                    references=[
+                        ReferenceData(
+                            reference=RangeReference(top_val, bottom_val),
+                        )
+                    ]
+                )
+                elements.append(element)
+                stats['photos_ok'] += 1
+            except Exception as e:
+                print(f'      ✗ Error processing {os.path.basename(photo_path)}: {e}')
+                stats['error_list'].append(f'{dataset_name} photo {os.path.basename(photo_path)}: {e}')
+                stats['errors'] += 1
+                skipped += 1
+
+        stats['photos_skipped'] += skipped
+
+        if not elements:
+            continue
+
+        try:
+            existing_groups = prj.groups_with_reference.filter(paths=[group_path])
+            group_for_borehole = next(
+                (g for g in existing_groups if g.root_borehole.id == borehole.id),
+                None
+            )
+
+            group_label = '/'.join(group_path)
+            if group_for_borehole is not None:
+                group_for_borehole.add_elements(elements)
+                group_for_borehole.save()
+                print(f'      ✓ Added {len(elements)} photo(s) to group "{group_label}"')
+            else:
+                group_for_borehole = prj.groups_with_reference.create(
+                    path=group_path,
+                    reference_family=REFERENCE_FAMILY,
+                    reference_unit=REFERENCE_UNIT,
+                    root_borehole=borehole,
+                    elements=elements,
+                )
+                group_for_borehole.save()
+                print(f'      ✓ Created group "{group_label}" with {len(elements)} photo(s)')
+        except Exception as e:
+            print(f'      ✗ Error saving photo group: {e}')
+            stats['error_list'].append(f'{dataset_name} photo group {var_name}: {e}')
+            stats['errors'] += 1
+
 
 def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats):
     """Process a single variable and save it to WAI DB."""
@@ -522,6 +674,10 @@ def _import_well_streaming(prj, filepath, stats):
             _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats)
             del var_info
 
+        photos = _load_dataset_photos(well_name, dataset_name, filepath)
+        if photos:
+            _process_photos(prj, well, dataset_name, photos, os.path.dirname(filepath), stats, reference_unit)
+
         stats['datasets_ok'] += 1
         del index_data
 
@@ -612,6 +768,10 @@ def _import_well_fallback(prj, filepath, stats):
             _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats)
             del var_info
 
+        photos = dataset.get('photos')
+        if photos:
+            _process_photos(prj, well, dataset_name, photos, os.path.dirname(filepath), stats, reference_unit)
+
         stats['datasets_ok'] += 1
         del dataset, index_data
 
@@ -638,6 +798,8 @@ def import_well_from_json(prj, filepath):
         'datasets_ok': 0,
         'curves_ok': 0,
         'curves_skipped': 0,
+        'photos_ok': 0,
+        'photos_skipped': 0,
         'errors': 0,
         'error_list': []
     }
@@ -707,6 +869,8 @@ def main():
     total_datasets = sum(s['datasets_ok'] for s in all_stats)
     total_curves = sum(s['curves_ok'] for s in all_stats)
     total_skipped = sum(s['curves_skipped'] for s in all_stats)
+    total_photos = sum(s['photos_ok'] for s in all_stats)
+    total_photos_skipped = sum(s['photos_skipped'] for s in all_stats)
     total_errors = sum(s['errors'] for s in all_stats)
 
     print(f'\nFiles processed:         {total_files}')
@@ -714,6 +878,8 @@ def main():
     print(f'Datasets processed:      {total_datasets}')
     print(f'Curves loaded:           {total_curves}')
     print(f'Curves skipped:          {total_skipped}')
+    print(f'Photos loaded:           {total_photos}')
+    print(f'Photos skipped:          {total_photos_skipped}')
     print(f'Errors:                  {total_errors}')
 
     error_wells = [s for s in all_stats if s['error_list']]

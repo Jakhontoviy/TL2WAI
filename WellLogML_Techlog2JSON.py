@@ -6,8 +6,234 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 import logging
 import re
+import shutil
 import numpy as np
 import TechlogDatabase as db
+
+# Photo export helpers
+_image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.gif')
+_MISSING_VALUE = -9999
+
+
+def _is_image_filename(value):
+    """Check if a value looks like an image filename."""
+    if not value or value == str(_MISSING_VALUE) or value == _MISSING_VALUE:
+        return False
+    if not isinstance(value, str):
+        return False
+    val_lower = value.lower().replace('/', '\\')
+    return val_lower.endswith(_image_extensions)
+
+
+def _find_photo_variables(well, dataset, pattern=""):
+    """Find variables that contain image filenames."""
+    photo_vars = []
+    for var in db.variableList(well, dataset):
+        if pattern and pattern.lower() not in var.lower():
+            continue
+        try:
+            values = db.variableLoad(well, dataset, var)
+            if values and len(values) > 0:
+                for val in values:
+                    if _is_image_filename(val):
+                        photo_vars.append(var)
+                        break
+        except Exception:
+            continue
+    return photo_vars
+
+
+def _export_dataset_photos_via_xml(well, dataset, photo_vars, base_output_dir, well_name_clean, index_data):
+    """
+    Extract photos via db.exportFile(XML) and copy them to the output folder.
+
+    Used as fallback when direct file copy cannot locate photos on disk.
+    Photos are stored in: base_output_dir/well_name_clean/dataset/photos/<var_name>/
+    Returns a dict ready for JSON serialization under dataset['photos'].
+    """
+    temp_dir = tempfile.mkdtemp(prefix="techlog_photos_")
+    try:
+        try:
+            db.exportFile(temp_dir, [well + '.' + dataset], 'XML')
+        except Exception as e:
+            print(f"  Warning: XML export failed for {well}.{dataset}: {e}")
+            return {}
+
+        xml_images_path = os.path.join(temp_dir, well, dataset)
+        if not os.path.exists(xml_images_path):
+            print(f"  Warning: XML export did not create folder: {xml_images_path}")
+            return {}
+
+        photos_info = {}
+        for var in photo_vars:
+            try:
+                values = db.variableLoad(well, dataset, var)
+            except Exception:
+                continue
+            if not values:
+                continue
+
+            photo_dir = os.path.join(base_output_dir, well_name_clean, dataset, "photos", var)
+            os.makedirs(photo_dir, exist_ok=True)
+
+            items = []
+            copied = 0
+
+            for i, val in enumerate(values):
+                if not _is_image_filename(val):
+                    continue
+
+                val_norm = str(val).replace('/', '\\')
+                basename = os.path.basename(val_norm)
+                src = os.path.join(xml_images_path, basename)
+
+                if not os.path.exists(src):
+                    continue
+
+                top = None
+                bottom = None
+                if index_data is not None and i < len(index_data):
+                    try:
+                        top = float(index_data[i])
+                    except Exception:
+                        top = None
+                if index_data is not None and (i + 1) < len(index_data):
+                    try:
+                        bottom = float(index_data[i + 1])
+                    except Exception:
+                        bottom = None
+
+                dst_name = basename
+                dst = os.path.join(photo_dir, dst_name)
+                if os.path.exists(dst):
+                    base_name, ext = os.path.splitext(dst_name)
+                    dst_name = f"{base_name}_{var}{ext}"
+                    dst = os.path.join(photo_dir, dst_name)
+
+                try:
+                    shutil.copy2(src, dst)
+                    copied += 1
+                    rel_path = os.path.relpath(dst, base_output_dir).replace('\\', '/')
+                    items.append({
+                        "top": top,
+                        "base": bottom,
+                        "filename": dst_name,
+                        "path": rel_path
+                    })
+                except Exception as e:
+                    print(f"  Warning: failed to copy photo {src}: {e}")
+
+            if copied > 0:
+                photos_info[var] = {
+                    "count": copied,
+                    "folder": os.path.relpath(photo_dir, base_output_dir).replace('\\', '/'),
+                    "items": items
+                }
+
+        return photos_info
+    finally:
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            pass
+
+
+def _export_dataset_photos(well, dataset, photo_vars, base_output_dir, well_name_clean, index_data):
+    """
+    Copy photos for a dataset to disk and return metadata for JSON.
+
+    Tries direct copy from <project>/Images/<well>/<dataset>/ first.
+    Falls back to XML export via db.exportFile() if no photos are found.
+
+    Photos are stored in: base_output_dir/well_name_clean/dataset/photos/<var_name>/
+    Returns a dict ready for JSON serialization under dataset['photos'].
+    """
+    if not photo_vars:
+        return {}
+
+    photos_info = {}
+    images_path = os.path.join(db.dirProject(), 'Images', well, dataset)
+
+    for var in photo_vars:
+        try:
+            values = db.variableLoad(well, dataset, var)
+        except Exception:
+            continue
+        if not values:
+            continue
+
+        photo_dir = os.path.join(base_output_dir, well_name_clean, dataset, "photos", var)
+        os.makedirs(photo_dir, exist_ok=True)
+
+        items = []
+        copied = 0
+
+        for i, val in enumerate(values):
+            if not _is_image_filename(val):
+                continue
+
+            top = None
+            bottom = None
+            if index_data is not None and i < len(index_data):
+                try:
+                    top = float(index_data[i])
+                except Exception:
+                    top = None
+            if index_data is not None and (i + 1) < len(index_data):
+                try:
+                    bottom = float(index_data[i + 1])
+                except Exception:
+                    bottom = None
+
+            val_norm = str(val).replace('/', '\\')
+
+            if os.path.isabs(val_norm) and os.path.exists(val_norm):
+                src = val_norm
+            else:
+                src = os.path.join(images_path, val_norm)
+                if not os.path.exists(src):
+                    basename = os.path.basename(val_norm)
+                    src = os.path.join(images_path, basename)
+
+            if os.path.exists(src):
+                dst_name = os.path.basename(val_norm)
+                dst = os.path.join(photo_dir, dst_name)
+                if os.path.exists(dst):
+                    base_name, ext = os.path.splitext(dst_name)
+                    dst_name = f"{base_name}_{var}{ext}"
+                    dst = os.path.join(photo_dir, dst_name)
+
+                try:
+                    shutil.copy2(src, dst)
+                    copied += 1
+
+                    rel_path = os.path.relpath(dst, base_output_dir).replace('\\', '/')
+
+                    items.append({
+                        "top": top,
+                        "base": bottom,
+                        "filename": dst_name,
+                        "path": rel_path
+                    })
+                except Exception as e:
+                    print(f"  Warning: failed to copy photo {src}: {e}")
+            else:
+                print(f"  Warning: photo file not found: {val}")
+
+        if copied > 0:
+            photos_info[var] = {
+                "count": copied,
+                "folder": os.path.relpath(photo_dir, base_output_dir).replace('\\', '/'),
+                "items": items
+            }
+
+    if not photos_info and photo_vars:
+        print(f"      Direct copy found no photos, trying XML export fallback...")
+        photos_info = _export_dataset_photos_via_xml(
+            well, dataset, photo_vars, base_output_dir, well_name_clean, index_data
+        )
+
+    return photos_info
 
 TECHLOG_JSON_ROOT = r'C:\Temp\TL'
 TECHLOG_JSON_LOG_DIR = os.path.join(TECHLOG_JSON_ROOT, 'log')
@@ -584,6 +810,14 @@ class WellLogMLGenerator:
         self.f.write('\n          }')   # close variables
         self.f.write('\n        }')     # close dataset
 
+    def write_photos(self, photos_dict: Dict[str, Any]):
+        """Write a photos block to the current dataset (after variables, before close)."""
+        if not photos_dict or self.f is None:
+            return
+        self.f.write(',\n')
+        self.f.write('          "photos": ')
+        self._write_dict_inline(photos_dict, '          ')
+
     def add_curve(self, well_name: str, dataset_name: str, variable_name: str,
                   data: Optional[np.ndarray] = None, null_value: float = -9999) -> bool:
         """
@@ -840,7 +1074,23 @@ def welllogml_write_from_techlog(output_dir: str = None):
                     except Exception:
                         ref_name = None
 
-                    variables_to_export = [v for v in variables if v != ref_name]
+                    # Load index data for photo depth association
+                    index_data = None
+                    if ref_name:
+                        try:
+                            index_data = db.variableLoad(well_name, dataset_name, ref_name)
+                            if index_data is not None and not isinstance(index_data, np.ndarray):
+                                index_data = np.array(index_data)
+                        except Exception:
+                            index_data = None
+
+                    # Detect photo variables
+                    photo_vars = _find_photo_variables(well_name, dataset_name)
+                    if photo_vars:
+                        print(f"      Photo variables detected: {', '.join(photo_vars)}")
+                        logger.info(f"      Photo variables detected: {', '.join(photo_vars)}")
+
+                    variables_to_export = [v for v in variables if v != ref_name and v not in photo_vars]
 
                     print(f"      Variables: {len(variables)} (index: {ref_name})")
                     logger.info(f"      Variables found: {len(variables)} (index curve: {ref_name})")
@@ -897,6 +1147,24 @@ def welllogml_write_from_techlog(output_dir: str = None):
                             error_msg = f"      [{var_idx}/{len(variables_to_export)}] Error loading {variable_name} ({var_type if 'var_type' in locals() else '?'}): {e}"
                             print(f"    ✗ {error_msg}")
                             logger.error(f"        {error_msg}")
+
+                    # Export photos
+                    if photo_vars:
+                        photos_info = _export_dataset_photos(
+                            well_name, dataset_name, photo_vars,
+                            folderName, well_name_clean, index_data
+                        )
+                        if photos_info:
+                            generator.write_photos(photos_info)
+                            total_photos = sum(p['count'] for p in photos_info.values())
+                            print(f"      Photos exported: {total_photos}")
+                            logger.info(f"      Photos exported: {total_photos}")
+                        else:
+                            print(f"      Photos: none found on disk")
+                            logger.info(f"      Photos: none found on disk")
+
+                    if index_data is not None:
+                        del index_data
 
                     generator.finalize_dataset()
 
