@@ -105,10 +105,32 @@ USE_FIELD_AS_FIELD = True
 VERBOSE = False
 
 # Overwrite vs skip when target objects already exist in WAI DB
-# True  = delete existing logs (by name+group) and photo groups (by path) before recreating
+# True  = delete existing objects (by name+group) and photo groups (by path) before recreating
 # False = leave existing objects untouched and skip the import of that object
 # Applies to both well.logs.create() and the GroupWithReference photo groups.
 OVERWRITE_EXISTING = True
+
+# Mapping from Techlog index family (read from db.variableFamily for the reference curve)
+# to the WAI DB ReferenceFamily string used by LogManager.create() and
+# GroupWithReference.create(). Names match WAI DB's ReferenceFamily enum values:
+# 'Measured Depth', 'True Vertical Depth', 'True Vertical Depth Sub Sea',
+# 'Geological Age', 'Sample ID'.
+# Techlog's "Reference" maps to Sample ID per user convention.
+# Unknown or empty values fall back to DEFAULT_REFERENCE_FAMILY for safety.
+TECHLOG_REFERENCE_FAMILY_MAP = {
+    'Measured Depth': 'Measured Depth',
+    'MD': 'Measured Depth',
+    'True Vertical Depth Sub Sea': 'True Vertical Depth Sub Sea',
+    'TVDSS': 'True Vertical Depth Sub Sea',
+    'TVDBML': 'Measured Depth',
+    'TVDBMLSS': 'True Vertical Depth Sub Sea',
+    'True Vertical Depth': 'True Vertical Depth',
+    'TVD': 'True Vertical Depth',
+    'Reference': 'Sample ID',
+    'Sample ID': 'Sample ID',
+    'Geological Age': 'Geological Age',
+}
+DEFAULT_REFERENCE_FAMILY = 'Measured Depth'
 
 # Retry connection on failure
 RETRY_CONNECTION = True
@@ -399,7 +421,7 @@ def _stream_dataset_variables(well_name, dataset_name, filepath):
 # Import functions
 # ---------------------------------------------------------------------------
 
-def _process_photos(prj, well, dataset_name, photos_dict, source_dir, stats, reference_unit=None):
+def _process_photos(prj, well, dataset_name, photos_dict, source_dir, stats, reference_unit=None, reference_family=None):
     """
     Import photos into WAI DB as image blobs grouped by depth intervals.
 
@@ -415,13 +437,14 @@ def _process_photos(prj, well, dataset_name, photos_dict, source_dir, stats, ref
     - source_dir: root folder used to resolve relative photo paths
     - stats: import statistics dict (mutated in place)
     - reference_unit: optional unit string for the depth reference (defaults to MD unit)
+    - reference_family: WAI DB ReferenceFamily string (e.g. 'Measured Depth',
+      'Sample ID'). Defaults to DEFAULT_REFERENCE_FAMILY.
     """
     if not photos_dict:
         return
 
     try:
         from client.shared.settings import MD_REFERENCE_UNIT
-        from client.shared.data_reference import ReferenceFamily
         from client.shared.blob_utilities.blob_types import BlobTypeID, BlobLink
         from client.shared.db.object_type import ObjectType
         from client.objects.group_with_reference.group_with_reference_element import Element
@@ -433,7 +456,7 @@ def _process_photos(prj, well, dataset_name, photos_dict, source_dir, stats, ref
             stats['photos_skipped'] += len(photo_info.get('items', []))
         return
 
-    REFERENCE_FAMILY = ReferenceFamily.MEASURED_DEPTH
+    REFERENCE_FAMILY = reference_family or DEFAULT_REFERENCE_FAMILY
     REFERENCE_UNIT = reference_unit or MD_REFERENCE_UNIT
 
     borehole = well.boreholes.get_by_name('default')
@@ -556,7 +579,7 @@ def _process_photos(prj, well, dataset_name, photos_dict, source_dir, stats, ref
             stats['errors'] += 1
 
 
-def _get_or_create_log(well, var_name, log_group, var_family, var_unit, index_unit, var_type, stats):
+def _get_or_create_log(well, var_name, log_group, var_family, var_unit, index_unit, var_type, stats, reference_family=None):
     """
     Resolve an existing log according to OVERWRITE_EXISTING.
 
@@ -568,6 +591,10 @@ def _get_or_create_log(well, var_name, log_group, var_family, var_unit, index_un
 
     When status is 'skipped' the caller must skip set_rvalues/save and
     bump the appropriate stats counter.
+
+    reference_family is a WAI DB family string (e.g. 'Measured Depth',
+    'Sample ID', 'True Vertical Depth Sub Sea'). When None, falls back
+    to DEFAULT_REFERENCE_FAMILY so the WAI DB default is still used.
     """
     existing = None
     try:
@@ -592,12 +619,23 @@ def _get_or_create_log(well, var_name, log_group, var_family, var_unit, index_un
         group=log_group,
         values_family=var_family,
         values_unit=var_unit,
+        reference_family=reference_family or DEFAULT_REFERENCE_FAMILY,
         reference_unit=index_unit
     )
     return log, 'overwrote' if existing is not None else 'created'
 
 
-def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats, dataset_group=None):
+def _resolve_reference_family(techlog_family):
+    """Map a Techlog variableFamily of the index curve to a WAI DB ReferenceFamily string.
+
+    Unknown or empty input falls back to DEFAULT_REFERENCE_FAMILY for safety.
+    """
+    if not techlog_family:
+        return DEFAULT_REFERENCE_FAMILY
+    return TECHLOG_REFERENCE_FAMILY_MAP.get(techlog_family.strip(), DEFAULT_REFERENCE_FAMILY)
+
+
+def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats, dataset_group=None, reference_family=None):
     """Process a single variable and save it to WAI DB."""
     try:
         var_data_raw = var_info.get('variableData', [])
@@ -643,7 +681,8 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
 
             log_group = [dataset_group, dataset_name] if dataset_group else [dataset_name]
             log, log_status = _get_or_create_log(
-                well, var_name, log_group, var_family or var_type, var_unit, index_unit, var_type, stats
+                well, var_name, log_group, var_family or var_type, var_unit, index_unit, var_type, stats,
+                reference_family=reference_family,
             )
             if log_status == 'skipped':
                 print(f'        ⊘ {var_name}: already exists in {log_group}, skipped')
@@ -736,7 +775,8 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
 
         log_group = [dataset_group, dataset_name] if dataset_group else [dataset_name]
         log, log_status = _get_or_create_log(
-            well, var_name, log_group, var_family, var_unit, index_unit, var_type, stats
+            well, var_name, log_group, var_family, var_unit, index_unit, var_type, stats,
+            reference_family=reference_family,
         )
         if log_status == 'skipped':
             print(f'        ⊘ {var_name}: already exists in {log_group}, skipped')
@@ -853,6 +893,7 @@ def _import_well_streaming(prj, filepath, stats):
 
         index_name = index.get('name', 'MD')
         index_unit = index.get('variableUnit', 'm')
+        index_family = _resolve_reference_family(index.get('variableFamily', ''))
         index_data_raw = index.get('variableData', [])
         index_data = np.array(index_data_raw)
         del index_data_raw, index
@@ -869,15 +910,15 @@ def _import_well_streaming(prj, filepath, stats):
             index_data, reference_unit, factor = convert_depth_to_meters(index_data, index_unit)
             _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit} → {reference_unit}, factor: {factor})')
         else:
-            _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit})')
+            _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit}, ref family: {index_family})')
 
         for var_name, var_info in _stream_dataset_variables(well_name, dataset_name, filepath):
-            _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats, dataset_group)
+            _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats, dataset_group, reference_family=index_family)
             del var_info
 
         photos = _load_dataset_photos(well_name, dataset_name, filepath)
         if photos:
-            _process_photos(prj, well, dataset_name, photos, os.path.dirname(filepath), stats, reference_unit)
+            _process_photos(prj, well, dataset_name, photos, os.path.dirname(filepath), stats, reference_unit, reference_family=index_family)
 
         stats['datasets_ok'] += 1
         del index_data
@@ -973,6 +1014,7 @@ def _import_well_fallback(prj, filepath, stats):
 
         index_name = index.get('name', 'MD')
         index_unit = index.get('variableUnit', 'm')
+        index_family = _resolve_reference_family(index.get('variableFamily', ''))
         index_data = np.array(index.get('variableData', []))
 
         if len(index_data) == 0:
@@ -985,20 +1027,20 @@ def _import_well_fallback(prj, filepath, stats):
         reference_unit = index_unit
         if CONVERT_DEPTH_TO_METERS and index_unit.lower() != 'm':
             index_data, reference_unit, factor = convert_depth_to_meters(index_data, index_unit)
-            _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit} → {reference_unit}, factor: {factor})')
+            _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit} → {reference_unit}, factor: {factor}, ref family: {index_family})')
         else:
-            _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit})')
+            _vprint(f'      Index: {index_name} ({len(index_data)} points, unit: {index_unit}, ref family: {index_family})')
 
         # Pop variables so they can be freed as we go
         variables = dataset.pop('variables', {})
         for var_name in list(variables.keys()):
             var_info = variables.pop(var_name)
-            _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats, dataset_group)
+            _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats, dataset_group, reference_family=index_family)
             del var_info
 
         photos = dataset.get('photos')
         if photos:
-            _process_photos(prj, well, dataset_name, photos, os.path.dirname(filepath), stats, reference_unit)
+            _process_photos(prj, well, dataset_name, photos, os.path.dirname(filepath), stats, reference_unit, reference_family=index_family)
 
         stats['datasets_ok'] += 1
         del dataset, index_data
