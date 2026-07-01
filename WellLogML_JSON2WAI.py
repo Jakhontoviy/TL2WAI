@@ -551,6 +551,26 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
         var_values = np.array(var_data_raw)
         del var_data_raw
 
+        # String-typed data (Zone Name, Description, fluid codes, etc.) cannot be stored
+        # as numeric logs in WAI DB. Detect early and skip with a visible message so the
+        # user sees what was dropped instead of a silent failure inside replace_null_values.
+        is_string_data = False
+        if var_values.dtype.kind == 'U':
+            is_string_data = True
+        elif var_values.dtype.kind == 'O' and len(var_values) > 0:
+            non_null = [v for v in var_values if v is not None]
+            if non_null and all(isinstance(v, str) for v in non_null):
+                is_string_data = True
+
+        if is_string_data:
+            sample = next((v for v in var_values if v is not None), '')
+            sample_repr = (sample[:50] + '...') if isinstance(sample, str) and len(sample) > 50 else sample
+            print(f'        ⊘ {var_name} ({var_type}, {var_unit}): string-typed data skipped (sample={sample_repr!r})')
+            stats.setdefault('strings_skipped', 0)
+            stats['strings_skipped'] += 1
+            del var_values
+            return
+
         # Detect accidental char-array from a single string value
         if var_values.dtype.kind == 'U' and len(var_values) > 1:
             if all(len(str(v)) == 1 for v in var_values):
@@ -978,6 +998,7 @@ def main(source_dir=None, project_name=None):
     total_datasets = sum(s['datasets_ok'] for s in all_stats)
     total_curves = sum(s['curves_ok'] for s in all_stats)
     total_skipped = sum(s['curves_skipped'] for s in all_stats)
+    total_strings = sum(s.get('strings_skipped', 0) for s in all_stats)
     total_photos = sum(s['photos_ok'] for s in all_stats)
     total_photos_skipped = sum(s['photos_skipped'] for s in all_stats)
     total_errors = sum(s['errors'] for s in all_stats)
@@ -987,6 +1008,7 @@ def main(source_dir=None, project_name=None):
     print(f'Datasets processed:      {total_datasets}')
     print(f'Curves loaded:           {total_curves}')
     print(f'Curves skipped:          {total_skipped}')
+    print(f'String curves skipped:  {total_strings}')
     print(f'Photos loaded:           {total_photos}')
     print(f'Photos skipped:          {total_photos_skipped}')
     print(f'Errors:                  {total_errors}')
