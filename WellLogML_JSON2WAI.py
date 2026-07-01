@@ -530,7 +530,8 @@ def _process_photos(prj, well, dataset_name, photos_dict, source_dir, stats, ref
         try:
             existing_groups = prj.groups_with_reference.filter(paths=[group_path])
             group_for_borehole = next(
-                (g for g in existing_groups if g.root_borehole.id == borehole.id),
+                (g for g in existing_groups
+                 if g.root_borehole is not None and g.root_borehole.id == borehole.id),
                 None
             )
 
@@ -549,6 +550,9 @@ def _process_photos(prj, well, dataset_name, photos_dict, source_dir, stats, ref
                     stats['error_list'].append(f'{dataset_name} photo group {var_name} delete: {del_err}')
                     stats['errors'] += 1
                     continue
+                # After delete, refetch the list so the post-create check below sees the
+                # fresh state and does not misclassify the recreated group as "existing".
+                existing_groups = prj.groups_with_reference.filter(paths=[group_path])
 
             group_for_borehole = prj.groups_with_reference.create(
                 path=group_path,
@@ -559,8 +563,8 @@ def _process_photos(prj, well, dataset_name, photos_dict, source_dir, stats, ref
             )
             group_for_borehole.save()
             if OVERWRITE_EXISTING and any(
-                g.root_borehole.id == borehole.id
-                for g in prj.groups_with_reference.filter(paths=[group_path])
+                g.root_borehole is not None and g.root_borehole.id == borehole.id
+                for g in existing_groups
             ):
                 _vprint(f'      ✓ Recreated group "{group_label}" with {len(elements)} photo(s)')
             else:
@@ -1095,7 +1099,7 @@ def main(source_dir=None, project_name=None):
 
     print(f'\nConnecting to server...')
     try:
-        gc = RemoteServer(user='alex', password='pass')
+        gc = RemoteServer(user='dev', password='dev')
         print(f'✓ Connected')
     except Exception as e:
         print(f'✗ Connection error: {e}')
