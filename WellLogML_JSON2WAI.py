@@ -565,9 +565,47 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
         if is_string_data:
             sample = next((v for v in var_values if v is not None), '')
             sample_repr = (sample[:50] + '...') if isinstance(sample, str) and len(sample) > 50 else sample
-            print(f'        ⊘ {var_name} ({var_type}, {var_unit}): string-typed data skipped (sample={sample_repr!r})')
-            stats.setdefault('strings_skipped', 0)
-            stats['strings_skipped'] += 1
+            _vprint(f'        ℹ {var_name} ({var_type}, {var_unit}): string-typed data (sample={sample_repr!r})')
+
+            # Resolve family for discrete/text logs
+            original_family = var_family
+            if not USE_FAMILY or not var_family:
+                try:
+                    mnemonic_info = prj.family_assigner.assign_family(var_name, var_unit)
+                    var_family = mnemonic_info.family
+                    if not USE_FAMILY:
+                        _vprint(f'        ℹ {var_name}: family auto-detected = {var_family}')
+                except Exception:
+                    var_family = original_family
+
+            log_group = [dataset_group, dataset_name] if dataset_group else [dataset_name]
+            log = well.logs.create(
+                name=var_name,
+                group=log_group,
+                values_family=var_family or var_type,
+                values_unit=var_unit,
+                reference_unit=index_unit
+            )
+
+            if var_properties:
+                props_count = apply_properties(log, var_properties)
+                if props_count > 0:
+                    _vprint(f'        ℹ Log properties loaded: {props_count}')
+
+            # WAI DB accepts text values via the same set_rvalues; for discrete logs we
+            # collapse consecutive duplicates so the storage stays compact.
+            try:
+                from client.shared.log_data_common import LogDataUtilities
+                ref_for_log, val_for_log = LogDataUtilities.remove_data_duplicates(index_data, var_values)
+                _vprint(f'        ℹ {var_name}: deduplicated {len(var_values)} → {len(val_for_log)} points')
+            except Exception as e:
+                _vprint(f'        ⚠ {var_name}: deduplication skipped ({e})')
+                ref_for_log, val_for_log = index_data, var_values
+
+            log.set_rvalues(ref_for_log, val_for_log)
+            log.save()
+            _vprint(f'        ✓ {var_name} (string, {var_family or var_type}, {var_unit}, {len(val_for_log)} points)')
+            stats['curves_ok'] += 1
             del var_values
             return
 
@@ -998,7 +1036,6 @@ def main(source_dir=None, project_name=None):
     total_datasets = sum(s['datasets_ok'] for s in all_stats)
     total_curves = sum(s['curves_ok'] for s in all_stats)
     total_skipped = sum(s['curves_skipped'] for s in all_stats)
-    total_strings = sum(s.get('strings_skipped', 0) for s in all_stats)
     total_photos = sum(s['photos_ok'] for s in all_stats)
     total_photos_skipped = sum(s['photos_skipped'] for s in all_stats)
     total_errors = sum(s['errors'] for s in all_stats)
@@ -1008,7 +1045,6 @@ def main(source_dir=None, project_name=None):
     print(f'Datasets processed:      {total_datasets}')
     print(f'Curves loaded:           {total_curves}')
     print(f'Curves skipped:          {total_skipped}')
-    print(f'String curves skipped:  {total_strings}')
     print(f'Photos loaded:           {total_photos}')
     print(f'Photos skipped:          {total_photos_skipped}')
     print(f'Errors:                  {total_errors}')
