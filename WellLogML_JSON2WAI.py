@@ -104,6 +104,12 @@ USE_FIELD_AS_FIELD = True
 # Verbose mode: lots of prints vs minimal output with progress bars
 VERBOSE = False
 
+# Overwrite vs skip when target objects already exist in WAI DB
+# True  = delete existing logs (by name+group) and photo groups (by path) before recreating
+# False = leave existing objects untouched and skip the import of that object
+# Applies to both well.logs.create() and the GroupWithReference photo groups.
+OVERWRITE_EXISTING = True
+
 # Retry connection on failure
 RETRY_CONNECTION = True
 
@@ -515,23 +521,80 @@ def _process_photos(prj, well, dataset_name, photos_dict, source_dir, stats, ref
 
             group_label = '/'.join(group_path)
             if group_for_borehole is not None:
-                group_for_borehole.add_elements(elements)
-                group_for_borehole.save()
-                _vprint(f'      ✓ Added {len(elements)} photo(s) to group "{group_label}"')
+                if not OVERWRITE_EXISTING:
+                    print(f'      ⊘ Photo group "{group_label}" already exists for this borehole, skipped')
+                    stats['photos_skipped'] += len(elements)
+                    continue
+                # Overwrite: drop the existing group (its blobs remain linked to the borehole
+                # as orphans; they cannot be deleted through this API)
+                try:
+                    group_for_borehole.delete()
+                except Exception as del_err:
+                    print(f'      ✗ Error deleting existing photo group "{group_label}": {del_err}')
+                    stats['error_list'].append(f'{dataset_name} photo group {var_name} delete: {del_err}')
+                    stats['errors'] += 1
+                    continue
+
+            group_for_borehole = prj.groups_with_reference.create(
+                path=group_path,
+                reference_family=REFERENCE_FAMILY,
+                reference_unit=REFERENCE_UNIT,
+                root_borehole=borehole,
+                elements=elements,
+            )
+            group_for_borehole.save()
+            if OVERWRITE_EXISTING and any(
+                g.root_borehole.id == borehole.id
+                for g in prj.groups_with_reference.filter(paths=[group_path])
+            ):
+                _vprint(f'      ✓ Recreated group "{group_label}" with {len(elements)} photo(s)')
             else:
-                group_for_borehole = prj.groups_with_reference.create(
-                    path=group_path,
-                    reference_family=REFERENCE_FAMILY,
-                    reference_unit=REFERENCE_UNIT,
-                    root_borehole=borehole,
-                    elements=elements,
-                )
-                group_for_borehole.save()
                 _vprint(f'      ✓ Created group "{group_label}" with {len(elements)} photo(s)')
         except Exception as e:
             _vprint(f'      ✗ Error saving photo group: {e}')
             stats['error_list'].append(f'{dataset_name} photo group {var_name}: {e}')
             stats['errors'] += 1
+
+
+def _get_or_create_log(well, var_name, log_group, var_family, var_unit, index_unit, var_type, stats):
+    """
+    Resolve an existing log according to OVERWRITE_EXISTING.
+
+    Returns (log, status) where status is one of:
+      'created'   - a brand-new log object ready for set_rvalues
+      'overwrote' - an existing log was deleted and a new one created (OVERWRITE_EXISTING=True)
+      'skipped'   - an existing log was kept as-is (OVERWRITE_EXISTING=False)
+      'error'     - something went wrong; caller should record the failure
+
+    When status is 'skipped' the caller must skip set_rvalues/save and
+    bump the appropriate stats counter.
+    """
+    existing = None
+    try:
+        existing = well.logs.get_by_name(name=var_name, group=log_group)
+    except Exception:
+        existing = None
+
+    if existing is not None:
+        if not OVERWRITE_EXISTING:
+            return None, 'skipped'
+        try:
+            existing.delete()
+        except Exception as e:
+            print(f'        ✗ {var_name}: failed to delete existing log: {e}')
+            stats['error_list'].append(f'{var_name} delete: {e}')
+            stats['errors'] += 1
+            return None, 'error'
+        _vprint(f'        ℹ {var_name}: deleted existing log in {log_group}')
+
+    log = well.logs.create(
+        name=var_name,
+        group=log_group,
+        values_family=var_family,
+        values_unit=var_unit,
+        reference_unit=index_unit
+    )
+    return log, 'overwrote' if existing is not None else 'created'
 
 
 def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name, var_info, stats, dataset_group=None):
@@ -579,13 +642,17 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
                     var_family = original_family
 
             log_group = [dataset_group, dataset_name] if dataset_group else [dataset_name]
-            log = well.logs.create(
-                name=var_name,
-                group=log_group,
-                values_family=var_family or var_type,
-                values_unit=var_unit,
-                reference_unit=index_unit
+            log, log_status = _get_or_create_log(
+                well, var_name, log_group, var_family or var_type, var_unit, index_unit, var_type, stats
             )
+            if log_status == 'skipped':
+                print(f'        ⊘ {var_name}: already exists in {log_group}, skipped')
+                stats['curves_skipped'] += 1
+                del var_values
+                return
+            if log_status == 'error':
+                del var_values
+                return
 
             if var_properties:
                 props_count = apply_properties(log, var_properties)
@@ -668,13 +735,17 @@ def _process_variable(prj, well, dataset_name, index_data, index_unit, var_name,
                     _vprint(f'        ⚠ {var_name}: could not determine family, left empty')
 
         log_group = [dataset_group, dataset_name] if dataset_group else [dataset_name]
-        log = well.logs.create(
-            name=var_name,
-            group=log_group,
-            values_family=var_family,
-            values_unit=var_unit,
-            reference_unit=index_unit
+        log, log_status = _get_or_create_log(
+            well, var_name, log_group, var_family, var_unit, index_unit, var_type, stats
         )
+        if log_status == 'skipped':
+            print(f'        ⊘ {var_name}: already exists in {log_group}, skipped')
+            stats['curves_skipped'] += 1
+            del var_values
+            return
+        if log_status == 'error':
+            del var_values
+            return
 
         if var_properties:
             props_count = apply_properties(log, var_properties)
