@@ -803,15 +803,20 @@ class WellLogMLGenerator:
 
         return True
 
-    def finalize_dataset(self):
-        """Close the current dataset's variables block and the dataset object."""
+    def finalize_variables(self):
+        """Close the variables block. Call before write_photos() when photos are present."""
         if self.f is None:
             return
         self.f.write('\n          }')   # close variables
+
+    def finalize_dataset(self):
+        """Close the dataset object (call after write_photos if needed)."""
+        if self.f is None:
+            return
         self.f.write('\n        }')     # close dataset
 
     def write_photos(self, photos_dict: Dict[str, Any]):
-        """Write a photos block to the current dataset (after variables, before close)."""
+        """Write a photos block at dataset level (between variables and dataset close)."""
         if not photos_dict or self.f is None:
             return
         self.f.write(',\n')
@@ -1148,7 +1153,11 @@ def welllogml_write_from_techlog(output_dir: str = None):
                             print(f"    ✗ {error_msg}")
                             logger.error(f"        {error_msg}")
 
+                    # Close variables block before writing photos (so photos live at dataset level, not inside variables)
+                    generator.finalize_variables()
+
                     # Export photos
+                    photos_info = {}
                     if photo_vars:
                         photos_info = _export_dataset_photos(
                             well_name, dataset_name, photo_vars,
