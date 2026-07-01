@@ -83,57 +83,49 @@ except ImportError:
 # ========================
 # CONFIGURATION
 # ========================
+# Edit the values below to control how the importer behaves. Each setting
+# has a short description on the same line.
 
-PROJECT_NAME = 'AutoImport_fromTechlog'    # WAI DB project name to import into
-SOURCE_DIR = r'C:\Temp\TL'   # Folder containing JSON files to import
+# --- Connection ---------------------------------------------------------
+PROJECT_NAME    = 'AutoImport_fromTechlog'   # Target WAI DB project to import into
+RETRY_CONNECTION = True                      # Retry RemoteServer connection on failure
 
-SKIP_DATASETS = []  # Datasets to skip (e.g. 'Survey', 'MICP')
-NULL_VALUE = -9999.0   # Value treated as null/missing in Techlog data
-CONVERT_DEPTH_TO_METERS = False    # Convert depths to metres on import
+# --- Paths --------------------------------------------------------------
+SOURCE_DIR      = r'C:\Temp\TL'             # Folder containing JSON files exported by WellLogML_Techlog2JSON.py
 
-# Use the family from the JSON file or determine it automatically
-# True  = load variableFamily from the JSON file as-is
-# False = ignore variableFamily from JSON and auto-detect via prj.family_assigner
-USE_FAMILY = False
+# --- Filtering ----------------------------------------------------------
+SKIP_DATASETS   = []                         # Dataset names to skip entirely, e.g. ['Survey', 'MICP']
+NULL_VALUE      = -9999.0                    # Numeric value treated as null/missing in Techlog data
+CONVERT_DEPTH_TO_METERS = False              # Convert depths from ft/km/in to metres on import
 
-# Use the Field property from JSON to set the field (place) in WAI DB
-# True  = when creating a well, use the Field/field property from JSON as the field
-# False = use the default field
-USE_FIELD_AS_FIELD = True
+# --- WAI DB behaviour ----------------------------------------------------
+USE_FAMILY      = False                     # Use variableFamily from JSON as-is; False = auto-detect via prj.family_assigner
+USE_FIELD_AS_FIELD = True                    # Use the Field property from JSON as the WAI DB field for the well
+OVERWRITE_EXISTING = True                    # True = delete existing logs/photo groups before recreating; False = skip if present
+VERBOSE         = False                     # True = per-curve prints; False = minimal output with progress bars
 
-# Verbose mode: lots of prints vs minimal output with progress bars
-VERBOSE = False
-
-# Overwrite vs skip when target objects already exist in WAI DB
-# True  = delete existing objects (by name+group) and photo groups (by path) before recreating
-# False = leave existing objects untouched and skip the import of that object
-# Applies to both well.logs.create() and the GroupWithReference photo groups.
-OVERWRITE_EXISTING = True
-
-# Mapping from Techlog index family (read from db.variableFamily for the reference curve)
-# to the WAI DB ReferenceFamily string used by LogManager.create() and
-# GroupWithReference.create(). Names match WAI DB's ReferenceFamily enum values:
-# 'Measured Depth', 'True Vertical Depth', 'True Vertical Depth Sub Sea',
-# 'Geological Age', 'Sample ID'.
-# Techlog's "Reference" maps to Sample ID per user convention.
-# Unknown or empty values fall back to DEFAULT_REFERENCE_FAMILY for safety.
+# --- Reference family mapping ------------------------------------------
+# Maps a Techlog index variableFamily (read from the reference curve) to a
+# WAI DB ReferenceFamily string used by LogManager.create() and
+# GroupWithReference.create(). WAI DB family strings are:
+#   'Measured Depth', 'True Vertical Depth', 'True Vertical Depth Sub Sea',
+#   'Geological Age', 'Sample ID'.
+# Techlog's "Reference" maps to 'Sample ID'. Unknown / empty values fall
+# back to DEFAULT_REFERENCE_FAMILY for safety.
 TECHLOG_REFERENCE_FAMILY_MAP = {
-    'Measured Depth': 'Measured Depth',
-    'MD': 'Measured Depth',
+    'Measured Depth':              'Measured Depth',
+    'MD':                          'Measured Depth',
     'True Vertical Depth Sub Sea': 'True Vertical Depth Sub Sea',
-    'TVDSS': 'True Vertical Depth Sub Sea',
-    'TVDBML': 'Measured Depth',
-    'TVDBMLSS': 'True Vertical Depth Sub Sea',
-    'True Vertical Depth': 'True Vertical Depth',
-    'TVD': 'True Vertical Depth',
-    'Reference': 'Sample ID',
-    'Sample ID': 'Sample ID',
-    'Geological Age': 'Geological Age',
+    'TVDSS':                       'True Vertical Depth Sub Sea',
+    'TVDBML':                      'Measured Depth',
+    'TVDBMLSS':                    'True Vertical Depth Sub Sea',
+    'True Vertical Depth':         'True Vertical Depth',
+    'TVD':                         'True Vertical Depth',
+    'Reference':                   'Sample ID',
+    'Sample ID':                   'Sample ID',
+    'Geological Age':              'Geological Age',
 }
-DEFAULT_REFERENCE_FAMILY = 'Measured Depth'
-
-# Retry connection on failure
-RETRY_CONNECTION = True
+DEFAULT_REFERENCE_FAMILY = 'Measured Depth'   # Fallback when Techlog family is empty or unmapped
 
 
 # ========================

@@ -1,4 +1,12 @@
 # -*- coding: utf-8 -*-
+# =============================================================================
+# WellLogML Exporter — Techlog DB -> WellLogML JSON files
+# =============================================================================
+# Run this script from inside Techlog's Python interpreter to dump every well
+# in the current Techlog project to a JSON file. Run WellLogML_JSON2WAI.py
+# afterwards to load those files into a WAI DB project.
+# =============================================================================
+
 import json
 import os
 import tempfile
@@ -10,7 +18,23 @@ import shutil
 import numpy as np
 import TechlogDatabase as db
 
-# Photo export helpers
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Root folder where exported JSON files and per-run logs are written.
+TECHLOG_JSON_ROOT = r'C:\Temp\TL'
+
+# Folder for run logs (created automatically). Created as <TECHLOG_JSON_ROOT>/log.
+TECHLOG_JSON_LOG_DIR = os.path.join(TECHLOG_JSON_ROOT, 'log')
+
+
+# =============================================================================
+# Internal helpers (do not edit)
+# =============================================================================
+
+# Recognised image file extensions when scanning Techlog photo variables.
 _image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.gif')
 _MISSING_VALUE = -9999
 
@@ -234,9 +258,6 @@ def _export_dataset_photos(well, dataset, photo_vars, base_output_dir, well_name
         )
 
     return photos_info
-
-TECHLOG_JSON_ROOT = r'C:\Temp\TL'
-TECHLOG_JSON_LOG_DIR = os.path.join(TECHLOG_JSON_ROOT, 'log')
 
 
 class WellLogMLGenerator:
